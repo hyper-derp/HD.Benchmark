@@ -1,0 +1,191 @@
+{
+  "total_peers": 20,
+  "total_pairs": 10,
+  "instance_count": 4,
+  "peers": [
+    {
+      "id": 0,
+      "pub": "1c318140eb965024157029db65925b5b7976bcbd78169f0f23c03fa76e17f04d",
+      "priv": "011633ef261d2025cb71e614953fb1ded0630a434df3c1276c1df7d0732b8792"
+    },
+    {
+      "id": 1,
+      "pub": "f67cda7ebcf5d377a3b80853ce649f770bf85b66de74ded7b9f4df081150f673",
+      "priv": "2f443eed7796260e8237c2363c5cf9cfcd05be1d91cf68be94af3a7336e7bd99"
+    },
+    {
+      "id": 2,
+      "pub": "73435edbc68c529917a16f9d3a6911717be042611520949a37ce6a237ff75236",
+      "priv": "593af2c380d338240c9015372a09c34a058b66c6e8095fb2c1ff434cc4809b8f"
+    },
+    {
+      "id": 3,
+      "pub": "65cbe046609d4afb6742267091ec2bada3e411236dfce3c735e375b686caad70",
+      "priv": "dfa253ca191cc793ce8f26eb0de0d94c810d0408b0f5b495a17e4414ea67eb58"
+    },
+    {
+      "id": 4,
+      "pub": "ce2ce4e7560efc72c11e0dc1d2dc65bfadcc70f44e6da890c3c9d8c2d7a6df07",
+      "priv": "eb88dd53164c91c9cca9634a4d7b987ec554ffd30c4438d7dfc5c08296533bb7"
+    },
+    {
+      "id": 5,
+      "pub": "93ef4a2060332634fd9c7dedfa7cf35cb74334fc7d6cc8282e29597393985d28",
+      "priv": "0c9198805a698dab292bcc2d9489b43f1695f7d37625b267314494d3621498cb"
+    },
+    {
+      "id": 6,
+      "pub": "116fc416464501c496b61cec9ff112eff6a16226ffe267661f1195b747fa985c",
+      "priv": "ff3368ce54dd2ca51a1c38b0c97bceae5b6c241763bcb9953608a494714d8476"
+    },
+    {
+      "id": 7,
+      "pub": "71eef521ee2a809f650009c3fcc06d555cc600628ca9a8d984dcef9b340c4a73",
+      "priv": "d05452bb898efcf7c57bd64d188124adf5c5cc9cc79b789241e55d05958613d5"
+    },
+    {
+      "id": 8,
+      "pub": "089011ef4eeb4c4874aede9c7f12ba1be41b4f182c4693bfb7dc6267581c3c72",
+      "priv": "abeccf9fca5bb3bb803b9278fb6787b27b74cb4173185e5269bf21035fa23d72"
+    },
+    {
+      "id": 9,
+      "pub": "96fdedf163448f87c1a5a9017fec689d666fca18b221d94217e6329a3cd09933",
+      "priv": "d78edb007f9e2e6119f0c7fffdc9a4f302da92c7f44157a9f7135e1996f2b7f2"
+    },
+    {
+      "id": 10,
+      "pub": "b2924fd210e3485b3cc1f2049a24c61ca55022259fcd5b2019e4de04b638d332",
+      "priv": "0d17b7d21d174815e726bee5d58b1e2ac3c2c1526c9fd65132b4e6794efa29e8"
+    },
+    {
+      "id": 11,
+      "pub": "ea7fbb24cfb68057022eae8bedbd82f11aa5dc979414b0e36a7c0a7495ee2753",
+      "priv": "3396101a6cd52149d738edb9ec4e8cb504fc684f170fca22103511115d00391e"
+    },
+    {
+      "id": 12,
+      "pub": "b26fcc62d70d2b9ffe7aab8b45997bd8933113c190aa37eec16b53650fdb5008",
+      "priv": "96af99b2bee8f75ad85ebc2e961f19df382b81d8b7a61575e6bcc35af1614a2a"
+    },
+    {
+      "id": 13,
+      "pub": "854cfdfa58a7d6ac70c615b76fb99321f27a63cd99c396ed8eec4218e81b026d",
+      "priv": "c297198ba9db9aad4d6fb7c462b417503f878325395a47d7dd645756966a4cfa"
+    },
+    {
+      "id": 14,
+      "pub": "3ebf3f539862c4694a699724dc1fa257cff7812f8d6bc5de6df0d9a8ed715071",
+      "priv": "4971b0da32ab6f04d96d33723b4b5a7ee513c06c4bd16f4da52ea5f50a4976b7"
+    },
+    {
+      "id": 15,
+      "pub": "795c23c37cc1694e9d796805175c5835f3295a3a4e78e0e5912f1c31e0be476b",
+      "priv": "eb12c4adc4967d3c07f7c66671d1824314bafb18cacbc153b563f238688ee372"
+    },
+    {
+      "id": 16,
+      "pub": "3b683017ed17897c3cdfcdde5de2d54d4d28049c6e2a644713cd957e3078d86c",
+      "priv": "df81035bf3cc37a5962cd4914fdf7ac29fa2c5d23f815a9aa1dd8a2c83f33d8f"
+    },
+    {
+      "id": 17,
+      "pub": "e93752627a24e1162aabdb8c2ca92181f6df59633c8d5e0afa37f492bd89ee2a",
+      "priv": "769ec0c0527991c467e9a9a573e64fa99bd3be87841600ff0ab3d83c868cafcc"
+    },
+    {
+      "id": 18,
+      "pub": "f4b4e70bfa2f9580e54424a19ad59ab06cc68f37a2d27d8e32d5b47bec002717",
+      "priv": "60924a5f2304504c10e9e3658680576dac7e9cbd8dacd307debaa099f7361e56"
+    },
+    {
+      "id": 19,
+      "pub": "16ae5b9665e9a1fdf9ee181342d3bd07c7992fa58dd9130ce06103f93d19f53e",
+      "priv": "d878c80676f6982945edaac71ef9e8995867fccd8d2b8461663dac085665399b"
+    }
+  ],
+  "pairs": [
+    {
+      "sender": 0,
+      "receiver": 10
+    },
+    {
+      "sender": 1,
+      "receiver": 11
+    },
+    {
+      "sender": 2,
+      "receiver": 12
+    },
+    {
+      "sender": 3,
+      "receiver": 13
+    },
+    {
+      "sender": 4,
+      "receiver": 14
+    },
+    {
+      "sender": 5,
+      "receiver": 15
+    },
+    {
+      "sender": 6,
+      "receiver": 16
+    },
+    {
+      "sender": 7,
+      "receiver": 17
+    },
+    {
+      "sender": 8,
+      "receiver": 18
+    },
+    {
+      "sender": 9,
+      "receiver": 19
+    }
+  ],
+  "instances": [
+    {
+      "id": 0,
+      "peer_ids": [
+        0,
+        4,
+        8,
+        12,
+        16
+      ]
+    },
+    {
+      "id": 1,
+      "peer_ids": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ]
+    },
+    {
+      "id": 2,
+      "peer_ids": [
+        2,
+        6,
+        10,
+        14,
+        18
+      ]
+    },
+    {
+      "id": 3,
+      "peer_ids": [
+        3,
+        7,
+        11,
+        15,
+        19
+      ]
+    }
+  ]
+}
