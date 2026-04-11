@@ -188,20 +188,22 @@ HD p99 is load-invariant: 129-153 μs from idle through 150%. TS p99 rises from 
 
 At 150% load: HD p99 = 127 μs, TS p99 = 214 μs. **HD is 1.69x better on p99, 2.03x better on p999.** HD's latency actually decreases slightly at 150% (the io_uring busy-spin loop is always active, reducing syscall overhead). TS degrades monotonically.
 
-### 4 vCPU — HD stall bug
+### 4 vCPU — stall fixed
 
 | Load | HD p50 | HD p99 | TS p50 | TS p99 |
 |------|-------:|-------:|-------:|-------:|
-| Idle | 109 μs | 129 μs | 124 μs | 163 μs |
-| 50% | 137 μs | **366 μs** | 127 μs | **1,378 μs** |
-| 100% | 149 μs | **825 μs** | 131 μs | 172 μs |
-| 150% | 198 μs | **765 μs** | 124 μs | 171 μs |
+| Idle | 110 μs | 134 μs | 124 μs | 163 μs |
+| 25% | 111 μs | 137 μs | — | — |
+| 50% | 122 μs | 150 μs | 127 μs | 172 μs |
+| 75% | 113 μs | 143 μs | — | — |
+| 100% | 120 μs | 151 μs | 131 μs | 172 μs |
+| 150% | 116 μs | 150 μs | 124 μs | 171 μs |
 
-HD at 4 vCPU has intermittent multi-millisecond stalls at ≥50% load — backpressure oscillation with 2 workers entering a feedback loop. Three consecutive runs at 100% hit 593/2,579/3,923 μs p99. TS at 4 vCPU shows a single 12ms GC spike at 50% (one run out of 10) but is otherwise stable.
+HD numbers are post-fix (April 4 re-run, 10 runs per level). The backpressure stall that caused multi-millisecond p99 spikes at ≥50% load has been eliminated. Before the fix, three consecutive runs at 100% hit 593/2,579/3,923 μs p99. After: all runs are clean, p99 = 134-151 μs across all load levels.
 
-This is the top optimization target. The stall is triggered by sustained load exceeding the kTLS throughput of a single worker, causing the backpressure recv_pause flag to oscillate rapidly. The fix is wider hysteresis for low worker counts.
+The fix: wider hysteresis for low worker counts (resume at 1/8 instead of 1/4), minimum pause duration (8 CQE batch iterations), and reduced busy-spin (64 vs 256 iterations). See [4VCPU_STALL_FIX.md](docs/4VCPU_STALL_FIX.md) for analysis.
 
-Note: TS at 4 vCPU 50% also had one catastrophic run (p99 = 1,378 μs from a 12ms GC stop-the-world pause), but 9 of 10 runs were clean at ~172 μs.
+Note: TS at 4 vCPU 50% had one catastrophic run (p99 = 1,378 μs from a 12ms GC stop-the-world pause), but 9 of 10 runs were clean at ~172 μs. TS numbers are from the original (pre-fix) run — TS was not re-tested since its code did not change.
 
 ### 2 vCPU — both marginal
 
@@ -337,8 +339,8 @@ NIC bandwidth verified at 22 Gbps on all paths. Go derper verified as release bu
 
 ## Appendix: Known Issues
 
-### HD 4 vCPU backpressure stall
-At 4 vCPU with 2 workers under ≥50% load, the backpressure mechanism occasionally enters a feedback loop causing multi-millisecond latency stalls. Three consecutive runs at 100% load hit 593/2,579/3,923 μs p99. The stall is deterministic once triggered — caused by the recv_pause threshold being too sensitive for 2-worker configs. Fix: widen hysteresis gap for low worker counts.
+### HD 4 vCPU backpressure stall (fixed)
+At 4 vCPU with 2 workers under ≥50% load, the backpressure mechanism entered a feedback loop causing multi-millisecond latency stalls. Fixed with wider hysteresis (resume at 1/8), minimum pause duration, and reduced busy-spin. Post-fix p99 = 134-151 μs across all load levels (was 825 μs at 100% load). See [4VCPU_STALL_FIX.md](docs/4VCPU_STALL_FIX.md).
 
 ### TS GC pauses
 TS at 4 vCPU showed one 12ms stop-the-world GC pause at 50% load (p99 = 1,378 μs, 1 run out of 10). Not reproducible on larger configs.
