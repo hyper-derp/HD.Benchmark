@@ -383,10 +383,8 @@ def main():
   for c in CLIENTS:
     scp_to(c, "tooling/pairs/pairs_20.json", "/tmp/pairs.json")
 
-  # Stall fix verification: 4v only, then 8v/16v non-regression.
+  # 16v HD re-run (smoke test failed earlier).
   configs = [
-      ("4", "c4-highcpu-4", 2),
-      ("8", "c4-highcpu-8", 4),
       ("16", "c4-highcpu-16", 8),
   ]
 
