@@ -3,6 +3,11 @@
 import time
 from ssh import ssh, RELAY, RELAY_INTERNAL
 
+HD_RELAY_KEY = (
+    "aaaa1111bbbb2222cccc3333dddd4444"
+    "eeee5555ffff6666aaaa7777bbbb8888"
+)
+
 
 def setup_cert():
   """Generate TLS cert with all required SANs."""
@@ -50,6 +55,29 @@ def start_hd(workers):
       f"--workers {workers} "
       "--tls-cert /etc/ssl/certs/hd.crt "
       "--tls-key /etc/ssl/private/hd.key "
+      "--debug-endpoints --metrics-port 9090 "
+      "</dev/null >/tmp/hd.log 2>&1 & disown; "
+      "sleep 3",
+      timeout=30)
+  rc, out, _ = ssh(RELAY, "pgrep hyper-derp", timeout=10)
+  ok = out.strip().isdigit()
+  if ok:
+    time.sleep(2)
+  return ok
+
+
+def start_hd_protocol(workers):
+  """Start Hyper-DERP with HD Protocol enabled (kTLS)."""
+  stop_servers()
+  time.sleep(1)
+  ssh(RELAY,
+      "sudo modprobe tls; "
+      f"sudo nohup /usr/local/bin/hyper-derp --port 3340 "
+      f"--workers {workers} "
+      "--tls-cert /etc/ssl/certs/hd.crt "
+      "--tls-key /etc/ssl/private/hd.key "
+      f"--hd-relay-key {HD_RELAY_KEY} "
+      "--hd-enroll-mode auto "
       "--debug-endpoints --metrics-port 9090 "
       "</dev/null >/tmp/hd.log 2>&1 & disown; "
       "sleep 3",
