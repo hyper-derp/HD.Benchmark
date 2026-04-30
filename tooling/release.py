@@ -84,6 +84,13 @@ def _build_argparser():
                  help="path to a prior tag's results.json. When "
                       "set, the driver renders "
                       "diff_vs_<prev_tag>.md and stamps a verdict")
+  p.add_argument("--soak-duration", default=None,
+                 help="T2 soak total duration. Accepts '4h', "
+                      "'30m', '60s', or a plain int (seconds). "
+                      "Defaults: 24h tagged, 4h dev.")
+  p.add_argument("--soak-interval", default=None,
+                 help="Sampling interval for the continuous "
+                      "soak. Defaults: 60s tagged, 5s dev.")
   return p
 
 
@@ -182,6 +189,26 @@ def _detach_xdp_stage(relay):
   except Exception as e:
     return [{"test": "xdp-detach", "status": "fail",
              "reason": f"{type(e).__name__}: {e}"}]
+
+
+def _run_tier_t2(state_dir, args, mode, results_dir):
+  """Drive the T2 soak. Single stage, single Result-row per
+  sub-test (continuous + restart-cycle by default)."""
+  from scenarios.soak import parse_duration
+  out_dir = os.path.join(results_dir, "wg-relay", "T2")
+  os.makedirs(out_dir, exist_ok=True)
+  duration_s = parse_duration(
+      args.soak_duration or ("4h" if args.dev else "24h"))
+  interval_s = parse_duration(
+      args.soak_interval or ("5s" if args.dev else "60s"))
+  return _run_t1_stage(
+      state_dir, "t2-soak",
+      lambda: mode.t2_soak(
+          out_dir=out_dir,
+          duration_s=duration_s,
+          sampling_interval_s=interval_s,
+          log=_stage_logger(state_dir, "t2-soak")),
+      relay_host=mode.relay.host)
 
 
 def _run_t1_stage(state_dir, stage_name, stage_fn, *, relay_host):
@@ -339,11 +366,14 @@ def _run_tier(state_dir, args, tier, mode, results_dir):
         relay_host=mode.relay.host)
     return rows
 
-  # T2 / T3: stage 7 / 8 deliverables; log + skip.
+  if tier == "T2":
+    return _run_tier_t2(state_dir, args, mode, results_dir)
+
+  # T3: stage 8 deliverable; log + skip.
   state_mod.append_log(
       state_dir, "note",
-      text=(f"{tier} not implemented in stage-4 MVP; "
-            "skipping. Stage 7/8 will fill this."))
+      text=(f"{tier} not implemented yet; "
+            "skipping. Stage 8 will fill this."))
   return rows
 
 

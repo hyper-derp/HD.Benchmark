@@ -1420,3 +1420,185 @@ def _add_t1_hardening(WgRelayMode):
 
 
 _add_t1_hardening(WgRelayMode)
+
+
+# -- T2 (soak) orchestrators --------------------------------------
+
+
+def _add_t2_soak(WgRelayMode):
+  """Inject `t2_soak`, `_run_continuous_soak`,
+  `_run_restart_cycle` onto WgRelayMode.
+  """
+  from scenarios.soak import (
+      SoakSpec, run_soak, default_sampler,
+      evaluate_continuous, evaluate_restart_cycle,
+      write_samples)
+
+  def t2_soak(self, *, out_dir, duration_s,
+              sampling_interval_s=60,
+              sub_tests=("continuous", "restart-cycle"),
+              cap_mbps=None, log=print):
+    """Run T2 soak sub-tests. Returns Result-rows.
+
+    Args:
+      out_dir: per-tier output directory.
+      duration_s: total soak duration. Sub-tests scale this:
+        the continuous test runs for the full duration; the
+        restart-cycle test runs for the same duration but
+        kills the relay every 10 minutes (or proportionally
+        in dev mode).
+      sampling_interval_s: how often to snapshot during the
+        continuous sub-test.
+      sub_tests: which T2 catalog rows to run. Tuple of:
+        'continuous' / 'restart-cycle' / 'trickle-roam'.
+        Default skips trickle-roam — it's partially
+        implemented and the running agent should opt-in
+        explicitly.
+      cap_mbps: load cap for the continuous test (50% of
+        single-tunnel cap per the spec). When None, defaults
+        to 500 Mbps.
+      log: per-line logger.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cap_mbps = cap_mbps if cap_mbps is not None else 500
+    rows = []
+    if "continuous" in sub_tests:
+      rows.append(_run_continuous_soak(
+          self, out_dir=out_dir, duration_s=duration_s,
+          sampling_interval_s=sampling_interval_s,
+          rate_mbps=cap_mbps // 2,
+          log=log,
+          SoakSpec=SoakSpec, run_soak=run_soak,
+          default_sampler=default_sampler,
+          evaluate_continuous=evaluate_continuous,
+          write_samples=write_samples))
+    if "restart-cycle" in sub_tests:
+      rows.append(_run_restart_cycle(
+          self, out_dir=out_dir, duration_s=duration_s,
+          interval_s=min(600, max(60, duration_s // 12)),
+          log=log,
+          evaluate_restart_cycle=evaluate_restart_cycle))
+    if "trickle-roam" in sub_tests:
+      rows.append({
+          "test": "soak-trickle-roam",
+          "status": "not-implemented",
+          "reason": "stage-7 partial — needs per-platform "
+                    "wg-quick override + striker map size "
+                    "exposure on hdcli"})
+    return rows
+
+  WgRelayMode.t2_soak = t2_soak
+
+
+def _run_continuous_soak(mode, *, out_dir, duration_s,
+                          sampling_interval_s, rate_mbps,
+                          log, SoakSpec, run_soak,
+                          default_sampler, evaluate_continuous,
+                          write_samples):
+  """24h-continuous sub-test: long iperf3 UDP + RSS sampling."""
+  log(f"soak continuous: {rate_mbps} Mbps for {duration_s}s")
+  receiver = mode.topo.receiver()
+  sender = mode.topo.sender()
+  remote_log = "/tmp/_soak_iperf3_client.log"
+
+  def _start():
+    _stop_iperf3(receiver)
+    _start_iperf3_server(receiver, port=DEFAULT_IPERF3_PORT,
+                         duration_s=duration_s + 60)
+    cmd = (
+        f"setsid nohup iperf3 -c "
+        f"{shlex.quote(mode.topo.receiver_tunnel_ip())} "
+        f"-p {DEFAULT_IPERF3_PORT} -u -b {rate_mbps}M "
+        f"-l 1400 -t {duration_s} "
+        f"</dev/null >{shlex.quote(remote_log)} 2>&1 & "
+        "disown; sleep 1"
+    )
+    ssh(sender, cmd, timeout=30, no_tty=True)
+
+  def _stop():
+    _stop_iperf3(sender)
+    _stop_iperf3(receiver)
+
+  spec = SoakSpec(
+      name="soak-continuous",
+      duration_s=duration_s,
+      sampling_interval_s=sampling_interval_s,
+      sampler=default_sampler,
+      load_starter=_start,
+      load_stopper=_stop,
+      evaluator=evaluate_continuous,
+      relay=mode.relay)
+  row, samples = run_soak(spec, log=log)
+  write_samples(
+      os.path.join(out_dir, "continuous_samples.jsonl"),
+      samples)
+  return row
+
+
+def _run_restart_cycle(mode, *, out_dir, duration_s, interval_s,
+                        log, evaluate_restart_cycle):
+  """12h-restart-cycle sub-test.
+
+  Kills the relay every `interval_s`, restarts, measures
+  recovery + roster integrity. Loops until `duration_s` total
+  has elapsed.
+  """
+  log(f"soak restart-cycle: every {interval_s}s for "
+      f"{duration_s}s")
+  start_t = time.time()
+  end_t = start_t + duration_s
+  cycles = []
+  cycle_idx = 0
+  while time.time() < end_t:
+    cycle_idx += 1
+    info = mode.relay.wg_show()
+    peer_before = int(info.get("peer_count", "0"))
+    log(f"soak restart-cycle [{cycle_idx}]: stop")
+    mode.relay.stop()
+    cycle_started = time.time()
+    log(f"soak restart-cycle [{cycle_idx}]: start")
+    ok = mode.relay.start()
+    recovery_s = time.time() - cycle_started
+    if not ok:
+      cycles.append({
+          "cycle": cycle_idx, "status": "fail",
+          "reason": "relay failed to come back",
+          "recovery_s": recovery_s,
+          "peer_count_before": peer_before,
+          "peer_count_after": None})
+      break
+    info_after = mode.relay.wg_show()
+    peer_after = int(info_after.get("peer_count", "0"))
+    cycle = {
+        "cycle": cycle_idx,
+        "status": ("pass" if peer_after == peer_before
+                   else "fail"),
+        "recovery_s": round(recovery_s, 2),
+        "peer_count_before": peer_before,
+        "peer_count_after": peer_after,
+    }
+    if peer_after != peer_before:
+      cycle["reason"] = (
+          f"peer_count {peer_before} -> {peer_after}")
+    cycles.append(cycle)
+    # Wait until next cycle. Slice the sleep so we honour
+    # the duration cap.
+    next_at = cycle_started + interval_s
+    while time.time() < next_at and time.time() < end_t:
+      time.sleep(min(0.5, end_t - time.time()))
+  evaluation = evaluate_restart_cycle(cycles)
+  out = {
+      "test": "soak-restart-cycle",
+      "status": evaluation["status"],
+      "duration_s": duration_s,
+      "cycles": cycles,
+      "details": evaluation["details"],
+  }
+  with open(os.path.join(out_dir, "restart_cycles.json"),
+            "w") as f:
+    json.dump({"cycles": cycles, "details": evaluation["details"]},
+              f, indent=2)
+  return out
+
+
+_add_t2_soak(WgRelayMode)
