@@ -1,0 +1,20 @@
+# Per-row regression thresholds for `report/regression.py`.
+#
+# All numbers are inclusive: a delta exactly equal to the threshold
+# is "at the limit" but not blocking. Improvements (negative deltas)
+# never block; the regression module emits them as `improvement`
+# rows and they roll into the new baseline once the tag ships.
+#
+# Comments allowed at the start of any line; blank lines tolerated.
+# Two-space indents, single colon delimiter, no quoting needed.
+thresholds:
+  throughput_regression_pct: 5.0
+  p99_latency_regression_pct: 10.0
+  loss_increase_pp: 0.5
+  rss_slope_mb_per_hour: 1.0
+
+hardening:
+  zero_tolerance: true   # any non-pass blocks the release
+
+integrity:
+  zero_tolerance: true   # any sha256 mismatch blocks the release

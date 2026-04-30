@@ -37,6 +37,7 @@ from lib.relay import Relay
 from lib import state as state_mod
 from modes.wg_relay import WgRelayMode
 from report.baseline import render_baseline, render_per_tier_report
+from report import regression as regression_mod
 
 
 def _utcnow_iso():
@@ -79,6 +80,10 @@ def _build_argparser():
                  help="XDP path policy. 'auto' = userspace then "
                       "XDP if platform.NIC_INTERFACE is set; "
                       "'on' = XDP only; 'off' = userspace only.")
+  p.add_argument("--prev-results", default=None,
+                 help="path to a prior tag's results.json. When "
+                      "set, the driver renders "
+                      "diff_vs_<prev_tag>.md and stamps a verdict")
   return p
 
 
@@ -343,7 +348,7 @@ def _run_tier(state_dir, args, tier, mode, results_dir):
 
 
 def _write_report(*, state_dir, args, results_dir, tier_results):
-  """Emit baseline.md / per-tier report and log it."""
+  """Emit baseline.md / per-tier report + results.json + diff."""
   os.makedirs(results_dir, exist_ok=True)
   modes_list = [m.strip() for m in args.modes.split(",")]
   if args.dev:
@@ -364,7 +369,7 @@ def _write_report(*, state_dir, args, results_dir, tier_results):
         rows=rows)
   else:
     path = os.path.join(results_dir, "release_report.md")
-    body = render_baseline(  # placeholder until report/regression
+    body = render_baseline(
         ref=args.tag,
         platform=args.platform,
         modes=modes_list,
@@ -372,7 +377,74 @@ def _write_report(*, state_dir, args, results_dir, tier_results):
   with open(path, "w") as f:
     f.write(body)
   state_mod.append_log(state_dir, "report-written", path=path)
+
+  # Tagged runs also persist a Result-schema results.json so the
+  # next tag's run can diff against it.
+  if not args.dev:
+    results_path = os.path.join(results_dir, "results.json")
+    regression_mod.write_results_json(
+        results_path,
+        tag=args.tag,
+        platform=args.platform,
+        modes=modes_list,
+        tier_results=tier_results)
+    state_mod.append_log(
+        state_dir, "report-written", path=results_path)
+
+  # Optional regression diff when caller pointed us at a prior
+  # tag's results.json.
+  if args.prev_results and not args.dev:
+    diff_path = _emit_regression_diff(
+        state_dir=state_dir,
+        results_dir=results_dir,
+        args=args,
+        modes_list=modes_list,
+        tier_results=tier_results)
+    return diff_path or path
+
   return path
+
+
+def _emit_regression_diff(*, state_dir, results_dir, args,
+                           modes_list, tier_results):
+  """Render diff_vs_<prev>.md by comparing tier_results to
+  args.prev_results. Logs the verdict.
+  """
+  try:
+    prev_rows, prev_doc = regression_mod.load_results_json(
+        args.prev_results)
+  except OSError as e:
+    state_mod.append_log(
+        state_dir, "note",
+        text=f"regression: --prev-results unreadable: {e}")
+    return None
+  prev_tag = prev_doc.get("tag", "<unknown>")
+  curr_rows = []
+  for tier_rows in tier_results.values():
+    curr_rows += list(tier_rows)
+  cfg = regression_mod.release_thresholds()
+  diffs = regression_mod.diff_rows(
+      prev_rows=prev_rows, curr_rows=curr_rows,
+      thresholds=cfg["thresholds"])
+  verdict = regression_mod.overall_verdict(
+      diffs,
+      hardening_zero=cfg["hardening_zero_tolerance"],
+      integrity_zero=cfg["integrity_zero_tolerance"])
+  body = regression_mod.render_diff_md(
+      prev_tag=prev_tag, curr_tag=args.tag,
+      platform=args.platform, modes=modes_list,
+      diffs=diffs, verdict=verdict)
+  diff_path = os.path.join(
+      results_dir, f"diff_vs_{prev_tag}.md")
+  with open(diff_path, "w") as f:
+    f.write(body)
+  state_mod.append_log(
+      state_dir, "report-written", path=diff_path,
+      verdict=verdict)
+  state_mod.append_log(
+      state_dir, "note",
+      text=f"regression verdict vs {prev_tag}: {verdict}")
+  return diff_path
 
 
 def _planned_tiers(args):
