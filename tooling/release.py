@@ -140,6 +140,55 @@ def _log_run_start(state_dir, args, tier):
       budget_s=budget)
 
 
+def _stage_logger(state_dir, stage):
+  """Return a callable that appends `note` events for one stage."""
+  def _log(s):
+    state_mod.append_log(state_dir, "note", text=s, stage=stage)
+  return _log
+
+
+def _run_t1_stage(state_dir, stage_name, stage_fn, *, relay_host):
+  """Wrap one T1 sub-stage with begin/end + exception handling.
+
+  The four T1 sub-stages (throughput, hardening, integrity,
+  restart-recovery) all share the same lifecycle: begin_stage,
+  run, end_stage with a status derived from the rows it returned.
+  """
+  state_mod.begin_stage(
+      state_dir, stage_name,
+      liveness={
+          "kind": "remote_counter",
+          "host": relay_host,
+          "command": "hdcli wg show 2>&1 "
+                     "| awk '/rx_packets/{print $NF}'",
+      })
+  started = time.time()
+  try:
+    rows = stage_fn()
+  except Exception as e:
+    state_mod.end_stage(
+        state_dir, "fail",
+        duration_s=time.time() - started,
+        details={"exception": f"{type(e).__name__}: {e}"})
+    raise
+  n_pass = sum(1 for r in rows
+               if r.get("status") in ("ok", "pass"))
+  total = len(rows)
+  if total == 0:
+    end_status = "pass"
+  elif n_pass == total:
+    end_status = "pass"
+  elif n_pass == 0:
+    end_status = "fail"
+  else:
+    end_status = "partial"
+  state_mod.end_stage(
+      state_dir, end_status,
+      duration_s=time.time() - started,
+      details={"rows": total, "rows_pass": n_pass})
+  return rows
+
+
 def _budget_for(tier):
   """Wall-clock budget per tier, per the runbook tables."""
   return {
@@ -187,34 +236,33 @@ def _run_tier(state_dir, args, tier, mode, results_dir):
   if tier == "T1":
     out_dir = os.path.join(results_dir, "wg-relay", "T1")
     os.makedirs(out_dir, exist_ok=True)
-    state_mod.begin_stage(
+    rows = []
+    rows += _run_t1_stage(
         state_dir, "t1-throughput",
-        liveness={
-            "kind": "remote_counter",
-            "host": mode.relay.host,
-            "command": "hdcli wg show 2>&1 "
-                       "| awk '/rx_packets/{print $NF}'",
-        })
-    started = time.time()
-    try:
-      rows = mode.t1_throughput(
-          out_dir=out_dir,
-          runs=_runs_default(args),
-          latency_runs=args.latency_runs,
-          xdp=False,
-          log=lambda s: state_mod.append_log(
-              state_dir, "note", text=s, stage="t1-throughput"))
-    except Exception as e:
-      state_mod.end_stage(
-          state_dir, "fail",
-          duration_s=time.time() - started,
-          details={"exception": f"{type(e).__name__}: {e}"})
-      raise
-    n_ok = sum(1 for r in rows if r.get("status") == "ok")
-    state_mod.end_stage(
-        state_dir, "pass" if n_ok == len(rows) else "partial",
-        duration_s=time.time() - started,
-        details={"rows": len(rows), "rows_ok": n_ok})
+        lambda: mode.t1_throughput(
+            out_dir=out_dir, runs=_runs_default(args),
+            latency_runs=args.latency_runs, xdp=False,
+            log=_stage_logger(state_dir, "t1-throughput")),
+        relay_host=mode.relay.host)
+    rows += _run_t1_stage(
+        state_dir, "t1-hardening",
+        lambda: mode.t1_hardening(
+            out_dir=os.path.join(out_dir, "hardening"),
+            log=_stage_logger(state_dir, "t1-hardening")),
+        relay_host=mode.relay.host)
+    rows += _run_t1_stage(
+        state_dir, "t1-integrity",
+        lambda: mode.t1_integrity(
+            out_dir=os.path.join(out_dir, "integrity"),
+            runs=3 if not args.dev else 1,
+            log=_stage_logger(state_dir, "t1-integrity")),
+        relay_host=mode.relay.host)
+    rows += _run_t1_stage(
+        state_dir, "t1-restart-recovery",
+        lambda: mode.t1_restart_recovery(
+            out_dir=os.path.join(out_dir, "restart"),
+            log=_stage_logger(state_dir, "t1-restart-recovery")),
+        relay_host=mode.relay.host)
     return rows
 
   # T2 / T3: stage 7 / 8 deliverables; log + skip.

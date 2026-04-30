@@ -48,6 +48,10 @@ WG_UDP_PING_LOCAL = os.path.join(
     _REPO_ROOT, "clients", "wg_udp_ping.py")
 WG_UDP_PING_REMOTE = "/tmp/wg_udp_ping.py"
 
+WG_ATTACK_LOCAL = os.path.join(
+    _REPO_ROOT, "clients", "wg_attack.py")
+WG_ATTACK_REMOTE = "/tmp/wg_attack.py"
+
 # Default iperf3 server port we open on the receiver client.
 DEFAULT_IPERF3_PORT = 5201
 
@@ -59,9 +63,14 @@ class Topology:
   """Relay + clients + tunnel-IPs for a wg-relay run."""
 
   def __init__(self, relay_host, relay_endpoint_ip,
-               relay_port, clients, tunnel_ips):
+               relay_port, clients, tunnel_ips,
+               attacker_host=None):
     """All-positional constructor — kwarg-only would force every
     test to spell out fields that are always passed in this order.
+
+    `attacker_host`: optional 5th SSH host, off-path (not in the
+    roster). Required for T1 hardening rows; T0 / T1-throughput
+    don't need it. Defaults to None.
     """
     if len(clients) != len(tunnel_ips):
       raise ValueError(
@@ -75,6 +84,7 @@ class Topology:
     self.relay_port = relay_port
     self.clients = list(clients)
     self.tunnel_ips = list(tunnel_ips)
+    self.attacker_host = attacker_host
 
   def sender(self):
     """Default sender client (the iperf3 -c side)."""
@@ -105,6 +115,14 @@ class Topology:
     if len(self.tunnel_ips) < 4:
       return None
     return self.tunnel_ips[3]
+
+  def attacker(self):
+    """Attacker SSH host. None if topology has no attacker."""
+    return self.attacker_host
+
+  def relay_endpoint(self):
+    """`relay-ip:port` string — what the attacker targets."""
+    return f"{self.relay_endpoint_ip}:{self.relay_port}"
 
 
 # -- iperf3 helpers --------------------------------------------------
@@ -731,3 +749,465 @@ def _derive_cap(rows):
         and r.get("point", {}).get("label") == "udp-1G":
       return int(r["throughput_mbps"]["mean"])
   return None
+
+
+# -- T1 hardening generators ----------------------------------------
+
+
+class WgAttackGen(LoadGenerator):
+  """Drives `wg_attack.py` on the topology's attacker host.
+
+  `point` keys honoured:
+    attack_mode: 'amplification' | 'mac1-forgery' | 'non-wg'
+    pps:         packets per second (10000 default per spec)
+    duration_s:  attack duration
+  """
+
+  def __init__(self, topology, *, ssh_fn=None,
+               scp_to_fn=None, scp_from_fn=None):
+    if topology.attacker() is None:
+      raise ValueError(
+          "WgAttackGen needs topology.attacker_host set; got None")
+    self.topo = topology
+    self._ssh = ssh_fn if ssh_fn is not None else ssh
+    self._scp_to = scp_to_fn if scp_to_fn is not None else scp_to
+    self._scp_from = (scp_from_fn if scp_from_fn is not None
+                      else scp_from)
+    self._remote_out = None
+
+  def prepare(self, point, run_id, out_dir):
+    if not os.path.exists(WG_ATTACK_LOCAL):
+      raise RuntimeError(
+          f"helper missing: {WG_ATTACK_LOCAL}")
+    if not self._scp_to(self.topo.attacker(), WG_ATTACK_LOCAL,
+                        WG_ATTACK_REMOTE):
+      raise RuntimeError(
+          f"scp helper to {self.topo.attacker()} failed")
+    self._ssh(self.topo.attacker(),
+              "/usr/bin/pkill -9 -f wg_attack.py 2>/dev/null; "
+              "sleep 1",
+              timeout=10)
+
+  def start(self, point, run_id, out_dir):
+    mode = point.get("attack_mode")
+    if mode is None:
+      raise ValueError("WgAttackGen needs point.attack_mode")
+    self._remote_out = f"/tmp/{run_id}_attack.json"
+    cmd = (
+        f"python3 {WG_ATTACK_REMOTE} "
+        f"--mode {shlex.quote(mode)} "
+        f"--target {shlex.quote(self.topo.relay_endpoint())} "
+        f"--pps {int(point.get('pps', 10000))} "
+        f"--duration-s {int(point.get('duration_s', 30))} "
+        f"--output {shlex.quote(self._remote_out)}"
+    )
+    rc, _, err = self._ssh(self.topo.attacker(), cmd,
+                           timeout=int(point.get('duration_s', 30))
+                           + 60,
+                           no_tty=True)
+    if rc != 0:
+      raise RuntimeError(f"attack run failed: rc={rc} "
+                         f"err={err[:200]}")
+
+  def wait(self, timeout):
+    return True
+
+  def collect(self, point, run_id, out_dir):
+    if self._remote_out is None:
+      return []
+    local = os.path.join(out_dir, f"{run_id}_attack.json")
+    if not self._scp_from(self.topo.attacker(), self._remote_out,
+                          local):
+      return []
+    return [local]
+
+  def cleanup(self):
+    self._ssh(self.topo.attacker(),
+              "/usr/bin/pkill -9 -f wg_attack.py 2>/dev/null",
+              timeout=5)
+
+
+class IntegrityGen(LoadGenerator):
+  """Bit-exact integrity check: `dd /dev/urandom | tunnel | sha256`.
+
+  Emits a per-instance JSON with throughput + a `sha256_match`
+  bool. The scenarios layer treats sha256_match=False as a
+  zero-tolerance failure.
+
+  `point` keys honoured:
+    bytes:      total bytes to send (default 1 GiB)
+    duration_s: hard timeout (default 60 s — 1 GiB at 1 Gbps takes
+                ~10 s)
+  """
+
+  def __init__(self, topology, *, ssh_fn=None,
+               scp_from_fn=None,
+               port=4040):
+    self.topo = topology
+    self._ssh = ssh_fn if ssh_fn is not None else ssh
+    self._scp_from = (scp_from_fn if scp_from_fn is not None
+                      else scp_from)
+    self._port = port
+    self._remote_sender_log = None
+    self._remote_receiver_log = None
+
+  def prepare(self, point, run_id, out_dir):
+    self._ssh(self.topo.receiver(),
+              f"/usr/bin/pkill -9 -f 'nc -l' 2>/dev/null; "
+              f"/usr/bin/pkill -9 -x sha256sum 2>/dev/null; "
+              f"sleep 1",
+              timeout=10)
+
+  def start(self, point, run_id, out_dir):
+    n_bytes = int(point.get("bytes", 1 * 1024 * 1024 * 1024))
+    duration_s = int(point.get("duration_s", 60))
+
+    # Receiver: nc listens, pipes into sha256sum. Output captured
+    # so we can read both bytes-received and the digest.
+    self._remote_receiver_log = (
+        f"/tmp/{run_id}_recv.log")
+    recv_cmd = (
+        f"setsid nohup sh -c 'nc -l -p {self._port} -w 5 "
+        f"| sha256sum > {shlex.quote(self._remote_receiver_log)}' "
+        f"</dev/null >/dev/null 2>&1 & disown; sleep 1"
+    )
+    self._ssh(self.topo.receiver(), recv_cmd, timeout=10)
+
+    # Sender: dd urandom | tee sha256sum | nc to receiver.
+    self._remote_sender_log = f"/tmp/{run_id}_send.log"
+    send_cmd = (
+        f"head -c {n_bytes} /dev/urandom "
+        f"| tee >(sha256sum > {shlex.quote(self._remote_sender_log)}) "
+        f"| nc -q 2 {self.topo.receiver_tunnel_ip()} {self._port}"
+    )
+    rc, _, err = self._ssh(self.topo.sender(), send_cmd,
+                           timeout=duration_s + 30,
+                           no_tty=True)
+    if rc != 0:
+      raise RuntimeError(f"integrity send failed: rc={rc} "
+                         f"err={err[:200]}")
+    # Give the receiver a beat to flush.
+    time.sleep(2)
+
+  def wait(self, timeout):
+    return True
+
+  def collect(self, point, run_id, out_dir):
+    local_send = os.path.join(out_dir, f"{run_id}_send.log")
+    local_recv = os.path.join(out_dir, f"{run_id}_recv.log")
+    if not self._scp_from(self.topo.sender(),
+                          self._remote_sender_log, local_send):
+      return []
+    if not self._scp_from(self.topo.receiver(),
+                          self._remote_receiver_log, local_recv):
+      return []
+    sent_hash = _read_first_token(local_send)
+    recv_hash = _read_first_token(local_recv)
+    n_bytes = int(point.get("bytes", 1 * 1024 * 1024 * 1024))
+    instance = {
+        "run_id": run_id,
+        "tool": "integrity",
+        "bytes": n_bytes,
+        "sender_sha256": sent_hash,
+        "receiver_sha256": recv_hash,
+        "sha256_match": (sent_hash is not None
+                         and recv_hash is not None
+                         and sent_hash == recv_hash),
+    }
+    out = os.path.join(out_dir, f"{run_id}_integrity.json")
+    with open(out, "w") as f:
+      json.dump(instance, f, indent=2)
+    return [out]
+
+  def cleanup(self):
+    for h in (self.topo.sender(), self.topo.receiver()):
+      self._ssh(h,
+                "/usr/bin/pkill -9 -f 'nc -l' 2>/dev/null; "
+                "/usr/bin/pkill -9 -x sha256sum 2>/dev/null",
+                timeout=5)
+
+
+def _read_first_token(path):
+  """Return the first whitespace-delimited token of a file or None."""
+  try:
+    with open(path) as f:
+      tok = f.read().split()
+    return tok[0] if tok else None
+  except OSError:
+    return None
+
+
+# -- T1 hardening + integrity + restart-recovery orchestrators ------
+
+
+def _evaluate_mac1(before, after, victim):
+  """Pass: handshake-mismatch counter advanced, victim throughput
+  drop ≤ 10 %, attacker did NOT appear in `fwd_packets`.
+  """
+  delta = lambda k: int(after.get(k, 0)) - int(before.get(k, 0))  # noqa: E731
+  mismatch = (delta("drop_handshake_no_pubkey_match") +
+              delta("drop_handshake_pubkey_mismatch"))
+  fwd = delta("fwd_packets")
+  victim_throughput = (victim or {}).get("throughput_mbps") or 0
+  details = {
+      "drop_handshake_total": mismatch,
+      "fwd_packets_delta": fwd,
+      "victim_throughput_mbps": victim_throughput,
+  }
+  if mismatch <= 0:
+    return "fail", {**details, "reason":
+                    "no handshake-mismatch counter advance"}
+  # The victim ran 1 G UDP; the threshold says <10% drop, i.e.
+  # we expect ≥ 900 Mbps if the row is healthy.
+  if victim_throughput < 900:
+    return "fail", {**details, "reason":
+                    "victim throughput < 900 Mbps under attack"}
+  return "pass", details
+
+
+def _evaluate_amplification(before, after, victim):
+  """Pass: drop_no_link or drop_unknown_src advances; fwd_packets
+  contribution from the attacker stays ≈ 0.
+  """
+  delta = lambda k: int(after.get(k, 0)) - int(before.get(k, 0))  # noqa: E731
+  drops = delta("drop_no_link") + delta("drop_unknown_src")
+  fwd = delta("fwd_packets")
+  details = {"unregistered_drops": drops, "fwd_packets_delta": fwd}
+  if drops <= 0:
+    return "fail", {**details, "reason":
+                    "no drop_no_link / drop_unknown_src advance"}
+  return "pass", details
+
+
+def _evaluate_non_wg(before, after, victim):
+  """Pass: drop_not_wg_shaped advances ≈ at attacker pps."""
+  delta = lambda k: int(after.get(k, 0)) - int(before.get(k, 0))  # noqa: E731
+  shape_drops = delta("drop_not_wg_shaped")
+  details = {"drop_not_wg_shaped_delta": shape_drops}
+  if shape_drops <= 0:
+    return "fail", {**details, "reason":
+                    "no drop_not_wg_shaped advance"}
+  return "pass", details
+
+
+# -- WgRelayMode T1-hardening / integrity / restart-recovery --------
+
+
+def _hardening_specs(mode):
+  """Build the four T1 hardening AttackSpecs for this `mode`."""
+  from scenarios.attack import AttackSpec
+
+  victim_point = {"protocol": "udp", "rate_mbps": 1000,
+                  "duration_s": 30, "label": "victim-udp-1G"}
+
+  def _make_victim():
+    """Fresh victim generator per row."""
+    return Iperf3SingleTunnelGen(mode.topo)
+
+  specs = []
+  for name, attack_mode, pps, evaluator in (
+      ("hardening-mac1-forgery", "mac1-forgery", 10000,
+       _evaluate_mac1),
+      ("hardening-amplification-probe", "amplification", 10000,
+       _evaluate_amplification),
+      ("hardening-non-wg-shape", "non-wg", 100000,
+       _evaluate_non_wg),
+  ):
+    attacker = WgAttackGen(mode.topo)
+    # Wrap the attacker so the scenario passes the right kwargs.
+    bound = _BoundAttackGen(attacker, attack_mode=attack_mode,
+                            pps=pps)
+    specs.append(AttackSpec(
+        name=name,
+        description=f"{attack_mode} @ {pps} pps for 30 s",
+        attacker=bound,
+        victim=_make_victim() if name == "hardening-mac1-forgery"
+        else None,
+        duration_s=30,
+        counter_evaluator=evaluator,
+        stall_threshold_s=300))
+  return specs
+
+
+class _BoundAttackGen(LoadGenerator):
+  """Adapter: bake `attack_mode` + `pps` into a WgAttackGen so it
+  presents a clean LoadGenerator surface to the attack harness.
+  """
+
+  def __init__(self, inner, *, attack_mode, pps):
+    self._inner = inner
+    self._attack_mode = attack_mode
+    self._pps = pps
+
+  def _augment(self, point):
+    p = dict(point)
+    p["attack_mode"] = self._attack_mode
+    p["pps"] = self._pps
+    return p
+
+  def prepare(self, point, run_id, out_dir):
+    self._inner.prepare(self._augment(point), run_id, out_dir)
+
+  def start(self, point, run_id, out_dir):
+    self._inner.start(self._augment(point), run_id, out_dir)
+
+  def wait(self, timeout):
+    return self._inner.wait(timeout)
+
+  def collect(self, point, run_id, out_dir):
+    return self._inner.collect(self._augment(point), run_id,
+                               out_dir)
+
+  def cleanup(self):
+    self._inner.cleanup()
+
+
+def _add_t1_hardening(WgRelayMode):
+  """Inject `t1_hardening`, `t1_integrity`, `t1_restart_recovery`
+  onto WgRelayMode. Done as a function so the bulk of the module
+  stays readable.
+  """
+  from scenarios.attack import run_attack
+
+  def t1_hardening(self, *, out_dir, log=print):
+    """Run the four T1 hardening rows.
+
+    The roaming-attack row is intentionally surfaced as a stub —
+    real WG-handshake replay needs key material we don't have at
+    this layer; flagged in dev_log.md as a stage-5 design
+    question. Returns 4 result rows; the roaming row has
+    `status='not-implemented'`.
+    """
+    if self.topo.attacker() is None:
+      log("T1 hardening: no attacker host in topology — "
+          "skipping all hardening rows")
+      return [{"test": n, "status": "no-data",
+               "reason": "topology.attacker_host unset"}
+              for n in ("hardening-mac1-forgery",
+                        "hardening-amplification-probe",
+                        "hardening-non-wg-shape",
+                        "hardening-roaming-attack")]
+    rows = []
+    os.makedirs(out_dir, exist_ok=True)
+    for spec in _hardening_specs(self):
+      log(f"T1 hardening: {spec.name}")
+      try:
+        rows.append(run_attack(
+            spec, relay=self.relay, out_dir=out_dir,
+            run_id=spec.name, log=log))
+      except Exception as e:
+        rows.append({"test": spec.name, "status": "fail",
+                     "reason": f"{type(e).__name__}: {e}"})
+        try:
+          spec.attacker.cleanup()
+        except Exception:
+          pass
+        if spec.victim is not None:
+          try:
+            spec.victim.cleanup()
+          except Exception:
+            pass
+    rows.append({
+        "test": "hardening-roaming-attack",
+        "status": "not-implemented",
+        "reason": "needs WG-handshake capture-and-replay; "
+                  "stage-5 design question — see dev_log.md"})
+    return rows
+
+  def t1_integrity(self, *, out_dir, runs=3, log=print):
+    """Bit-exact integrity row: 3 repeats, any sha256 mismatch
+    is zero-tolerance.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    gen = IntegrityGen(self.topo)
+    matches = 0
+    failures = []
+    for run in range(1, runs + 1):
+      run_id = f"integrity_r{run:02d}"
+      try:
+        gen.prepare({}, run_id, out_dir)
+        gen.start({}, run_id, out_dir)
+        files = gen.collect({}, run_id, out_dir)
+      except Exception as e:
+        failures.append(f"run {run}: {type(e).__name__}: {e}")
+        try:
+          gen.cleanup()
+        except Exception:
+          pass
+        continue
+      if not files:
+        failures.append(f"run {run}: no result file")
+        continue
+      try:
+        with open(files[0]) as f:
+          data = json.load(f)
+      except (OSError, json.JSONDecodeError) as e:
+        failures.append(f"run {run}: parse {e}")
+        continue
+      if data.get("sha256_match"):
+        matches += 1
+      else:
+        failures.append(
+            f"run {run}: sha256 mismatch "
+            f"(sent={data.get('sender_sha256')}, "
+            f"recv={data.get('receiver_sha256')})")
+    status = "pass" if matches == runs else "fail"
+    return [{
+        "test": "bit-exact-integrity",
+        "status": status,
+        "runs": runs,
+        "matches": matches,
+        "failures": failures,
+    }]
+
+  def t1_restart_recovery(self, *, out_dir, log=print,
+                          recovery_threshold_s=30):
+    """Kill the relay daemon mid-traffic, restart, measure recovery
+    window. Pass: traffic resumes within `recovery_threshold_s`
+    AND the roster persists.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    if not self.relay.is_running():
+      return [{"test": "relay-restart-recovery",
+               "status": "fail",
+               "reason": "relay was not running before the test"}]
+    roster_before = self.relay.wg_show()
+    peer_count_before = int(roster_before.get("peer_count", "0"))
+    log("T1 restart-recovery: stopping relay")
+    self.relay.stop()
+    started_at = time.time()
+    log("T1 restart-recovery: starting relay")
+    ok = self.relay.start()
+    duration_s = time.time() - started_at
+    if not ok:
+      return [{"test": "relay-restart-recovery",
+               "status": "fail",
+               "reason": "relay failed to come back",
+               "duration_s": round(duration_s, 2)}]
+    roster_after = self.relay.wg_show()
+    peer_count_after = int(roster_after.get("peer_count", "0"))
+    status = "pass"
+    reasons = []
+    if duration_s > recovery_threshold_s:
+      status = "fail"
+      reasons.append(
+          f"recovery {duration_s:.1f}s > {recovery_threshold_s}s")
+    if peer_count_after != peer_count_before:
+      status = "fail"
+      reasons.append(
+          f"peer_count {peer_count_before} -> {peer_count_after}")
+    return [{
+        "test": "relay-restart-recovery",
+        "status": status,
+        "duration_s": round(duration_s, 2),
+        "peer_count_before": peer_count_before,
+        "peer_count_after": peer_count_after,
+        "reasons": reasons,
+    }]
+
+  WgRelayMode.t1_hardening = t1_hardening
+  WgRelayMode.t1_integrity = t1_integrity
+  WgRelayMode.t1_restart_recovery = t1_restart_recovery
+
+
+_add_t1_hardening(WgRelayMode)
