@@ -121,6 +121,172 @@ Same tier shape; tests adapted from existing scripts.
 
 These catalogs are filled in only when a release tag actually changes those modes — mode-specific tests don't run on every tag. A `mode_changed_since(prev_tag, mode)` helper in the regression module decides which mode catalogs to run for a given tag.
 
+## Release mode (auto-chained, hands-off)
+
+A real release qualification runs every tier — T0, T1, T2, T3 — back to back without further user input. The user invokes once, walks away, returns to a consolidated report. The framework owns the sequencing and the tier-boundary decisions.
+
+### Invocation
+
+```bash
+release.py --tag <tag> --modes <list> --platform <p>
+```
+
+When `--tag` is set and `--tier` is not, the driver runs the **auto-chain**: T0 → T1 → T2 → T3 in order, with the boundary policies below. The same script with `--tier` runs a single tier (existing behavior, used by monthly cron and one-off diagnoses).
+
+### Boundary policy
+
+The agent applies these without asking. Each row is "what the running agent does after tier N completes, depending on the result".
+
+| Tier N outcome | Next action |
+|----------------|-------------|
+| **T0 pass** | proceed to T1 |
+| **T0 fail** (any threshold breached, smoke could not pass) | **halt chain.** Tooling or platform is broken. No point running T1 against a platform whose smoke failed. |
+| **T0 hard halt** (≥ 3 failures, wake-up overrun, platform unreachable) | halt chain |
+| **T1 all-pass** | proceed to T2 |
+| **T1 some-block** (any row over threshold, any hardening fail, any `<no data>`) | **proceed to T2 anyway.** Final verdict will be BLOCK regardless; T2/T3 may add diagnostic value (e.g. T2 might surface that the T1 regression is correlated with a memory-growth issue, or T3 profile pinpoints the hot function). The chain only short-circuits on tooling/platform breakage, never on benchmark failures alone. |
+| **T1 hard halt** | halt chain |
+| **T2 pass / partial** | proceed to T3 |
+| **T2 hard halt** (silent corruption, OOM, unexplained resets) | proceed to T3 anyway. T3 is short, free, and may capture the failure in flame graphs. |
+| **T3 any outcome** | end of chain. T3 doesn't gate. |
+| **Cost cap on any tier** with no forward progress | halt chain |
+
+Halt-chain at any point still produces the consolidated report — partial results are part of the deliverable.
+
+### Defaults for hands-off operation
+
+For an unattended release run, the driver applies these defaults if not explicitly overridden:
+
+| Parameter | Default | Override |
+|-----------|---------|----------|
+| `--modes` | every mode listed for tagged-release in `configs/release.yaml` | explicit list |
+| `--platform` | every reachable platform listed for tagged-release | explicit name |
+| T2 duration | `24h` (full soak) | `--soak-duration 4h` for short variant; not normally used at release time |
+| T3 against | the previous tag's T3 result | `--against <prev_tag>` |
+| Cost cap (chain) | sum of per-tier budgets × 1.25 | `--chain-budget <hours>` |
+
+The mode and platform lists come from `release.yaml`, not from agent invention. If the running agent finds an empty list (e.g. the modes catalog file was lost), it halts and surfaces — it does not guess.
+
+### Consolidated report
+
+A single document at `results/<tag>/<platform>/<mode>/release_report.md` covering all tiers run:
+
+```
+# Release qualification — <tag> on <platform>
+
+Modes: wg-relay, derp
+Tiers: T0 (pass), T1 (BLOCK — 2 rows), T2 (pass), T3 (1 hot-function regression)
+Started: <ts>   Finished: <ts>   Wall-clock: <hours>
+Cost cap: <budget> / <actual> hours
+
+## Verdict: BLOCK
+
+## T0
+[per-stage summary, all rows pass/fail]
+
+## T1
+[full diff vs <prev_tag>, blocking rows highlighted]
+
+## T2
+[soak summary: RSS slope, handshake bumps, integrity checksum status]
+
+## T3
+[per-function attribution diff vs <prev_tag>, biggest movers]
+
+## Re-runs and fixes during the run
+[every fix-and-rerun from the process log, in order]
+
+## Open issues for human review
+[stalls, gaps, suspect data]
+```
+
+The agent emits the path to this report at end of chain. That is the only mandatory hand-off back to the human.
+
+### What "hands-off" means in practice
+
+- The agent does **not** stop between tiers to ask "should I continue".
+- The agent does **not** stop on a benchmark fail to ask "do you want me to retry". Rule 2's fix-and-rerun applies inside a tier; tier boundaries are governed by the policy table above.
+- The agent **does** stop and surface immediately on platform-level breakage (3 failures, wake-up overrun, cost cap with no progress). These are escalations, not check-ins.
+- The agent **does** produce the consolidated report at end-of-chain, however the chain ended.
+
+The only inputs the user gives are the four params at start (and most of them have sensible defaults). The only output the user gets is the consolidated report at the end. Everything else is handled.
+
+### Cost expectations (rough)
+
+| Mode | Wall clock | Notes |
+|------|-----------:|-------|
+| `release.py --tag X` (full chain, T2 24 h) | ~30 h | the canonical release-qualification run |
+| `release.py --tag X --soak-duration 4h` | ~12 h | for "we need to ship today" cycles; short soak is documented as such in the report |
+| `release.py --tier T1 --tag X` | 4-6 h | single-tier; used by monthly cron and one-off |
+
+A 30-hour unattended run depends critically on Rules 1 and 3 working — without continuous observation and a process log, you wake up to an unrecoverable mystery. Treat the runbook as the contract that makes hands-off feasible.
+
+## Dev mode
+
+Tier-gated runs assume two things: there's already a baseline to diff against, and the tooling itself is trusted. Neither is true at the start. **Dev mode** is how you bootstrap into the framework — and how you do iteration runs against unreleased code thereafter.
+
+### When to use it
+
+- **First baseline.** No prior tag to diff against. Run dev mode end-to-end to produce the seed numbers that future T1 runs regress against.
+- **Framework shake-down.** Tooling is brand-new (or recently changed). Dev mode exercises the harness without the consequences of a release gate, so bugs in the framework surface as `<not implemented>` / `<harness error>` rows rather than as false-positive release blocks.
+- **Unreleased dev runs.** Working on a branch (e.g. `wg-relay-hardening`), want to see whether a change moved the needle, but you haven't tagged. Dev mode against `HEAD` produces comparable numbers without forcing a tag-and-release cadence.
+
+### How it differs from tiered runs
+
+| Aspect | Tiered (T1 / T2) | Dev mode |
+|--------|------------------|----------|
+| Reference | a release tag | a git ref (`HEAD`, branch name, or arbitrary SHA) |
+| Output dir | `results/<tag>/<platform>/<mode>/` | `results/dev/<timestamp>/<ref>/<platform>/<mode>/` |
+| Regression diff | required, blocks on threshold breach | not produced |
+| Block on regression | yes | no — there is nothing to regress from |
+| Block on hardening fail | yes | yes (zero-tolerance checks still apply — failure is failure) |
+| Block on bit-exact mismatch | yes | yes (data integrity is non-negotiable) |
+| Methodology (run counts, sample sizes, rate ladder) | full per catalog | full per catalog — Rule 2 still applies |
+| Missing tooling for a row | not allowed (catalog is frozen at release time) | tolerated — row reads `<not implemented>`, run continues |
+| Wall-clock budget | per-tier strict | per-tier soft (overruns flagged but don't halt) |
+| Soak duration | as specified by `--duration` | shortened variant available — `--short` runs T2 at 4 h instead of 24 h |
+
+### Invocation
+
+`--dev` is a flag on the existing tier drivers, not a new driver. There is no `dev.py`. The agent runs the same scripts in sequence:
+
+```bash
+smoke.py    --dev --modes wg-relay --platform cloud-gcp-c4 --ref HEAD
+release.py  --dev --modes wg-relay --platform cloud-gcp-c4 --ref HEAD
+soak.py     --dev --modes wg-relay --platform cloud-gcp-c4 --ref HEAD --short
+profile.py  --dev --modes wg-relay --platform cloud-gcp-c4 --ref HEAD
+```
+
+Each `--dev` run drops its results into a single timestamped subdir (the timestamp is set once per dev session by the first invocation; subsequent invocations in the same session reuse it). Final layout:
+
+```
+results/dev/2026-04-29T20-30-00Z/wg-relay-hardening-<sha7>/
+├── cloud-gcp-c4/
+│   └── wg-relay/
+│       ├── T0.json
+│       ├── T1.json
+│       ├── T2-short.json
+│       ├── T3/
+│       └── log.jsonl
+└── baseline.md            # human-readable summary, not a diff
+```
+
+### Output: the baseline report
+
+Tiered runs produce `diff_vs_<prev_tag>.md`. Dev mode produces `baseline.md` — same structure (one row per catalog entry), but with absolute numbers and `<not implemented>` / `<harness error>` markers instead of a delta column. This baseline is the artifact that becomes the reference for the first real T1 run.
+
+When you tag a release after a dev session, the implementing agent (or a follow-up dev run at the tag) produces `results/<tag>/...` — the regression module then diffs that against the most recent dev `baseline.md` for the same `(platform, mode)`. From that point on, normal tiered runs take over.
+
+### What dev mode does NOT loosen
+
+- **The three rules in the runbook.** Continuous observation, data integrity, process log — all still apply. Dev mode doesn't excuse skipping wake-ups or accepting nonsense data.
+- **Hardening failures.** Zero tolerance on every tier and mode. A forged-MAC1 packet that gets forwarded is a fail in dev mode just like in T1.
+- **Bit-exact integrity.** Data corruption is data corruption.
+- **The catalog itself.** Methodology (rate ladder, run counts, sample sizes) is fixed by the catalog. Dev mode does not let the agent shorten a rate sweep or drop a sample to "make it run". The only catalog-shaping concession is the soak `--short` variant (4 h instead of 24 h), which exists specifically to verify the soak harness without committing to a real soak.
+
+### What dev mode unblocks for the agent
+
+The runbook's "halt on no baseline" implication goes away — there is no expected previous result, so no `<no data>` for missing-prior. The "tooling stub" rows simply get `<not implemented>` markers and the run continues. Step D's failure budget still applies but with a higher tolerance for harness-error classifications (separate counter from genuine stalls — see runbook for details).
+
 ## Tooling layout
 
 ```

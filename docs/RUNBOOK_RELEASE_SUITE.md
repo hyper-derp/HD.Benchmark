@@ -117,14 +117,98 @@ Reading that, anyone can see exactly what happened, when, what decisions were ma
 
 ## What you are running
 
-The release suite has four tiers (T0 / T1 / T2 / T3) × modes × platforms. See [`RELEASE_BENCHMARK_SUITE.md`](RELEASE_BENCHMARK_SUITE.md) for the full design. As the running agent you will be told **which tier, which mode(s), which platform**, e.g. "run T1 against wg-relay on cloud-gcp-c4 for tag 0.2.1". Your job:
+The release suite has four tiers (T0 / T1 / T2 / T3) × modes × platforms. As the running agent you operate in one of three invocation modes:
+
+| Invocation | Typical command from user | What you do |
+|------------|---------------------------|-------------|
+| **Release auto-chain** | "run release for tag 0.2.1" (`release.py --tag 0.2.1`) | Run T0 → T1 → T2 → T3 unattended, applying boundary policies (below). Produce one consolidated report at the end. This is the default for tagged releases. |
+| **Single tier** | "run T1 against wg-relay on cloud-gcp-c4 for tag 0.2.1" (`release.py --tier T1 --tag 0.2.1`) | Run that tier only. Used by monthly cron, one-off diagnosis, or after a fix to re-validate a specific tier. |
+| **Dev mode** | "run dev against ref HEAD" (`release.py --dev --ref HEAD`) | Bootstrap baseline / framework shake-down. No regression diff, output to `results/dev/<ts>/`. May skip rows that aren't implemented yet. |
+
+Your job in all three:
 
 1. Set up the platform (call `setup_release_suite.py`).
-2. Drive the tier (call `release.py` / `soak.py` / `profile.py` / `smoke.py`).
-3. Watch.
+2. Drive the run (single tier driver call, or the auto-chain in release mode).
+3. Watch — almost all of your active runtime.
 4. Report.
 
-Almost all of your active runtime is step 3.
+The user's input is the four params at start. Your output is one report at end. **You do not stop in between to ask questions.** Boundary decisions in the auto-chain follow the policy table below; mid-tier decisions follow Rules 1/2/3. If you find yourself wanting to message the user mid-run, you are violating Rule 2 — finish the run, surface the question in the consolidated report.
+
+## Auto-chain procedure (release mode)
+
+This is what you do when invoked as `release.py --tag <tag>` (no `--tier`). The chain runs T0 through T3 in order, each tier is one stage-block in `state.json`, and you apply boundary policies between tiers without asking.
+
+### State model
+
+Extend `state.json` with a `chain` field:
+
+```jsonc
+{
+  // existing fields ...
+  "invocation": "release-chain",         // or "single-tier" or "dev"
+  "chain": {
+    "planned":  ["T0", "T1", "T2", "T3"],
+    "current":  "T1",
+    "completed":[
+      { "tier": "T0", "status": "pass",  "duration_s": 280, "report": "..." }
+    ],
+    "verdict_so_far": "RELEASE-OK"        // updated after each tier
+  }
+}
+```
+
+When a tier completes, you:
+
+1. Append a `tier-end` line to `log.jsonl` with the per-tier verdict.
+2. Apply the boundary policy (table below) to decide whether to continue.
+3. If continuing: pop the next tier, reset `current_stage` to that tier's first catalog entry, write `state.json`, ScheduleWakeup at the new tier's normal cadence.
+4. If halting: produce the consolidated report immediately and exit.
+
+### Boundary policy
+
+| Tier just completed | Outcome | Next action |
+|---------------------|---------|-------------|
+| T0 | all pass | run T1 |
+| T0 | any fail (smoke threshold breach) | **halt chain.** Smoke is the gate; if it fails, T1 is meaningless. Update `verdict_so_far = BLOCK`. |
+| T0 | hard halt (3 failures / wake-up overrun / unreachable) | halt chain |
+| T1 | all-pass | run T2 |
+| T1 | some BLOCK (regression / hardening fail / `<no data>`) | run T2 anyway. Update `verdict_so_far = BLOCK`. T2/T3 still run for diagnostic data. |
+| T1 | hard halt | halt chain |
+| T2 | pass | run T3 |
+| T2 | partial / fail | run T3 anyway. Update `verdict_so_far = BLOCK` if the failure is corruption / OOM / unexplained reset (zero-tolerance). T3 may capture the underlying issue in flame graphs. |
+| T2 | hard halt | run T3 anyway (T3 is short and free; finish the chain). Update verdict appropriately. |
+| T3 | any outcome | end of chain. T3 never gates. |
+| Any tier | cost cap with no forward progress | halt chain |
+
+Note: "halt chain" still produces the consolidated report. Partial chains are valid deliverables — the report makes clear which tiers ran and which were skipped.
+
+### What never short-circuits the chain
+
+- A regression that exceeds threshold → T1 BLOCK row, but the chain continues for diagnostics.
+- A hardening test failing → T1 BLOCK row, chain continues.
+- A bit-exact integrity mismatch → T1 BLOCK row, chain continues (T2/T3 may show the corruption pattern).
+- A fixable stall, fixed and re-run → not a chain event at all, just a fix-and-rerun within a tier.
+
+The chain only short-circuits on **platform / framework brokenness**, never on **benchmark verdicts**. The reasoning: a broken platform makes more data untrustworthy, but a regression on a working platform makes more data more useful.
+
+## Single-tier procedure
+
+`release.py --tier <T> --tag <tag>` runs exactly one tier. State machine is the auto-chain machine with `chain.planned = ["T<n>"]`. Boundary policy never fires (only one tier). Report is the per-tier report from the existing reporting section, not the consolidated one.
+
+Used for: monthly cron of T2, one-off T3 profile capture, T1 re-run after a fix landed.
+
+## Dev-mode procedure
+
+`release.py --dev --ref <ref>` runs the framework against a non-tagged reference (HEAD, branch, SHA). Differences from a tagged release run:
+
+1. **Output location.** `results/dev/<timestamp>/<ref>-<sha7>/<platform>/<mode>/` instead of `results/<tag>/...`. The timestamp is set once at session start (the first `setup_release_suite.py` invocation creates the directory) and reused by subsequent driver calls in the same session.
+2. **No regression diff.** `report/regression.py` is not invoked. The output is a `baseline.md` containing absolute numbers, not a delta.
+3. **Tooling stubs are tolerated.** A catalog row whose harness isn't implemented gets `<not implemented>` in the result and a `note` in the log. The chain continues. (In a tagged-release run the catalog is frozen so this case shouldn't arise; if it does, halt.)
+4. **Soak short variant.** `--soak-duration 4h` is the dev default — exercises the soak harness and the long-poll watch cadence without committing to 24 h.
+5. **Cost cap soft.** Overruns are flagged in the log and the report, but don't auto-halt unless paired with no forward progress (same as auto-chain rule). Dev mode favors completion of the framework shake-down over budget discipline.
+6. **What's preserved.** Rules 1, 2, 3 in full. Hardening zero-tolerance. Bit-exact integrity zero-tolerance. Methodology (run counts / sample sizes / rate ladder) — never reduced.
+
+The dev-mode report (`baseline.md`) becomes the reference that the first tagged-release T1 diffs against. Once a release is tagged, normal regression tracking takes over.
 
 ## Pre-flight: the setup script
 
@@ -414,8 +498,12 @@ Profile is short (1–2 h) and bounded by the actual capture commands (`perf rec
 
 Once `stages_pending` is empty (or the run was halted on cost cap / 3-failure rule):
 
-1. **Aggregate.** Run `report/aggregate.py --tag <t> --platform <p>` to compute per-row stats (mean, SD, 95 % CI, CV) over the per-run JSONs.
-2. **Diff.** Run `report/regression.py --tag <t> --against <prev_tag> --platform <p>`. This produces `results/<t>/<p>/diff_vs_<prev_tag>.md`.
+### For a single-tier or dev-mode run
+
+1. **Aggregate.** Run `report/aggregate.py --ref <ref> --platform <p>` to compute per-row stats (mean, SD, 95 % CI, CV) over the per-run JSONs.
+2. **Diff or baseline.**
+   - Tagged single-tier: `report/regression.py --tag <t> --against <prev_tag> --platform <p>` → `results/<t>/<p>/diff_vs_<prev_tag>.md`.
+   - Dev mode: skip regression; produce `results/dev/<ts>/<ref>/<p>/baseline.md` with absolute numbers, no delta column.
 3. **Account for gaps and re-runs.** Walk through `failures` in `state.json`. For each:
    - **Fixable, re-run clean** → diff is comparable. Note in the report (one line per cause + fix).
    - **Opaque stall** → diff row reads `<stall — see forensics/<path>>`. Do not synthesize a value.
@@ -436,6 +524,61 @@ Once `stages_pending` is empty (or the run was halted on cost cap / 3-failure ru
    ```
 
    Honesty over polish. A report that says "we couldn't collect 3 rows because the platform was broken" is more useful than a report that hides it.
+
+### For an auto-chain release run
+
+When `state.chain.completed` covers the planned tiers (or the chain was halted), produce a **consolidated report** instead of per-tier diffs:
+
+1. **Aggregate per tier** as above (one aggregate per tier that ran).
+2. **Diff per tier** against the previous tag's same-tier results (T1 vs T1, T2 vs T2, T3 vs T3). T0 has no diff — it's pass/fail only.
+3. **Compose `release_report.md`** at `results/<tag>/<platform>/release_report.md`:
+
+   ```markdown
+   # Release qualification — <tag> on <platform>
+
+   Modes: <list>
+   Tiers run: T0 (<verdict>), T1 (<verdict>), T2 (<verdict>), T3 (<n hot-function regressions>)
+   Started: <ts>   Finished: <ts>   Wall-clock: <hours>
+   Cost cap: <budget> / <actual> hours
+
+   ## Verdict: <RELEASE-OK | BLOCK>
+
+   ## T0 — smoke
+   <per-stage pass/fail table>
+
+   ## T1 — release gate
+   <full diff table vs <prev_tag>, blocking rows highlighted>
+
+   ## T2 — soak
+   <RSS slope, handshake-bump cadence, integrity checksum, unexpected resets>
+
+   ## T3 — profile
+   <per-function attribution diff vs <prev_tag>, biggest movers, flame graph paths>
+
+   ## Re-runs and fixes during the run
+   <every fix-and-rerun from log.jsonl, in order>
+
+   ## Open issues for human review
+   <stalls, gaps, suspect data, anything that needs eyes>
+   ```
+
+4. **Final verdict computation.** `RELEASE-OK` only if every tier that ran is pass AND no zero-tolerance check failed (hardening, bit-exact, OOM, corruption). Any single BLOCK row in any tier → `BLOCK`. Any halted-chain → `BLOCK` if a planned tier didn't run, otherwise the verdict computed from what did.
+
+5. **Attach the log.** Same as before — path to `log.jsonl` in the report. For long auto-chain runs the log can be 10+ MB; include a `tail -n 1000` excerpt inline plus a path to the full file.
+
+6. **Final report to user (auto-chain).** A short message:
+
+   ```
+   Release qualification complete for <tag> on <platform>.
+   Wall-clock: <hours> (budget: <hours>).
+   Tiers: T0 pass, T1 BLOCK (2 rows: single-tunnel-sweep-userspace 5G, hardening-mac1-forgery), T2 pass, T3 1 hot-function regression.
+   Verdict: BLOCK
+   Report: <path to release_report.md>
+   <one paragraph: biggest deltas, both improvements and regressions, what to investigate first>
+   <if any re-runs happened: one line summarizing the fixes applied>
+   ```
+
+   This is the only message the user gets between invocation and end-of-chain. Make it count.
 
 7. **Memory.** If you observed something surprising — a new failure mode, a stall pattern not covered here, an environmental fragility, a fixable cause that recurred and might be worth automating into setup — update the relevant memory file under `~/.claude/projects/-home-karl-dev-HD-Benchmark/memory/`. Don't write a memory for "this run passed" — only for things that change how the next run should be approached.
 
