@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """WireGuard-relay attacker helper for T1 hardening rows.
 
-Three on-the-wire shapes the daemon must drop or rate-limit:
+Four on-the-wire shapes the daemon must drop, rate-limit, or
+quarantine:
 
   --mode amplification
       Type 0x04 (transport-data) UDP packets at `--pps` from this
@@ -22,12 +23,15 @@ Three on-the-wire shapes the daemon must drop or rate-limit:
       `drop_not_wg_shaped`. Sustained at higher pps to exercise
       the XDP fast-path / userspace softirq cost.
 
-Roaming attack is *not* implemented here — that needs a captured
-WG handshake to replay from a forged source IP. Stubbed in
-modes/wg_relay.py with a flag for the running agent to fill in
-after a real fleet capture.
+  --mode roaming-replay --payload <path>
+      Reads a 148-byte WG handshake-init payload (captured via
+      `wg_capture.py` from a real legit peer) and replays it from
+      THIS source IP at `--pps`. The relay sees a familiar pubkey
+      arriving from a new 4-tuple — the relearn / striker logic
+      must keep the legit path confirmed and quarantine the
+      attacker's source. Counter: `drop_relearn_unconfirmed`.
 
-Output: a JSON summary on stdout when the run ends:
+Output: a JSON summary on stdout (or `--output`) when the run ends:
   {"tool": "wg_attack", "mode": "...", "target": "addr:port",
    "duration_s": N, "packets_sent": K, "send_errors": E}
 """
@@ -82,14 +86,38 @@ _BUILDERS = {
 }
 
 
-def run_attack(target, mode, pps, duration_s, output_path):
+def _make_replay_builder(payload_path):
+  """Return a builder closure that yields the captured payload.
+
+  The payload is read once at start; replays send identical bytes
+  at `--pps`. The relay's anti-roaming logic doesn't care that
+  the bytes are stale (Noise nonces will fail decrypt, but the
+  relearn-candidate accounting fires before decrypt).
+  """
+  with open(payload_path, "rb") as f:
+    payload = f.read()
+  if len(payload) != 148 or payload[0] != 0x01:
+    raise ValueError(
+        f"{payload_path}: expected 148-byte handshake-init, "
+        f"got len={len(payload)} type={payload[:1].hex()}")
+  return lambda: payload
+
+
+def run_attack(target, mode, pps, duration_s, output_path,
+               payload_path=None):
   """Send packets at `pps` for `duration_s` seconds. Spin-paced."""
   host, _, port_s = target.partition(":")
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   # Allow same-port reuse so a second attacker process can run.
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
   addr = (host, int(port_s))
-  builder = _BUILDERS[mode]
+  if mode == "roaming-replay":
+    if not payload_path:
+      raise ValueError(
+          "roaming-replay needs --payload <path>")
+    builder = _make_replay_builder(payload_path)
+  else:
+    builder = _BUILDERS[mode]
 
   interval_s = 1.0 / max(1, pps)
   end_at = time.time() + duration_s
@@ -133,7 +161,7 @@ def main(argv=None):
   """Argparse + dispatch."""
   p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
   p.add_argument("--mode",
-                 choices=tuple(_BUILDERS),
+                 choices=tuple(_BUILDERS) + ("roaming-replay",),
                  required=True)
   p.add_argument("--target", required=True,
                  help="addr:port of the relay's WG listen port")
@@ -142,9 +170,13 @@ def main(argv=None):
   p.add_argument("--duration-s", type=int, default=30)
   p.add_argument("--output", default=None,
                  help="write JSON summary here (default: stdout)")
+  p.add_argument("--payload", default=None,
+                 help="path to a 148-byte WG handshake-init "
+                      "payload (roaming-replay only); produced "
+                      "by wg_capture.py")
   args = p.parse_args(argv)
   run_attack(args.target, args.mode, args.pps, args.duration_s,
-             args.output)
+             args.output, payload_path=args.payload)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,11 @@ WG_ATTACK_LOCAL = os.path.join(
     _REPO_ROOT, "clients", "wg_attack.py")
 WG_ATTACK_REMOTE = "/tmp/wg_attack.py"
 
+WG_CAPTURE_LOCAL = os.path.join(
+    _REPO_ROOT, "clients", "wg_capture.py")
+WG_CAPTURE_REMOTE = "/tmp/wg_capture.py"
+WG_HANDSHAKE_PAYLOAD = "/tmp/wg_handshake.bin"
+
 # Default iperf3 server port we open on the receiver client.
 DEFAULT_IPERF3_PORT = 5201
 
@@ -793,6 +798,10 @@ class WgAttackGen(LoadGenerator):
     if mode is None:
       raise ValueError("WgAttackGen needs point.attack_mode")
     self._remote_out = f"/tmp/{run_id}_attack.json"
+    payload_arg = ""
+    if mode == "roaming-replay":
+      payload = point.get("payload_path", WG_HANDSHAKE_PAYLOAD)
+      payload_arg = f" --payload {shlex.quote(payload)}"
     cmd = (
         f"python3 {WG_ATTACK_REMOTE} "
         f"--mode {shlex.quote(mode)} "
@@ -800,6 +809,7 @@ class WgAttackGen(LoadGenerator):
         f"--pps {int(point.get('pps', 10000))} "
         f"--duration-s {int(point.get('duration_s', 30))} "
         f"--output {shlex.quote(self._remote_out)}"
+        f"{payload_arg}"
     )
     rc, _, err = self._ssh(self.topo.attacker(), cmd,
                            timeout=int(point.get('duration_s', 30))
@@ -990,59 +1000,207 @@ def _evaluate_non_wg(before, after, victim):
   return "pass", details
 
 
+def _evaluate_roaming(before, after, victim):
+  """Pass: relay's relearn-unconfirmed counter advances during the
+  replay AND fwd_packets does NOT spike from the attacker's source.
+
+  We can't directly count "fwd_packets attributed to attacker" from
+  hdcli output — fwd_packets is global. So the test is conservative:
+  if the attacker's replay was active AND drop_relearn_unconfirmed
+  did not advance at all, the relay accepted the rebind (fail).
+  Tightening this requires a per-source counter that hdcli doesn't
+  yet emit; flagged in dev_log.md.
+  """
+  delta = lambda k: int(after.get(k, 0)) - int(before.get(k, 0))  # noqa: E731
+  relearn = delta("drop_relearn_unconfirmed")
+  details = {"drop_relearn_unconfirmed_delta": relearn}
+  if relearn <= 0:
+    return "fail", {**details, "reason":
+                    "no drop_relearn_unconfirmed advance "
+                    "(rebind possibly accepted)"}
+  return "pass", details
+
+
+class WgCaptureGen(LoadGenerator):
+  """One-shot tcpdump-based handshake capture.
+
+  Runs `wg_capture.py` on the relay (which sees every legit
+  handshake) for a short window, scps the resulting 148-byte
+  payload to the attacker host. After this generator returns,
+  `WG_HANDSHAKE_PAYLOAD` exists on the attacker host.
+
+  Used as the `prepare()` step of the roaming-attack row, not as a
+  stand-alone scenario. Triggers a fresh handshake by bouncing
+  wg0 on the legit sender right before the capture window.
+  """
+
+  def __init__(self, topology, *, ssh_fn=None,
+               scp_to_fn=None, scp_from_fn=None,
+               sudo="sudo"):
+    self.topo = topology
+    self._ssh = ssh_fn if ssh_fn is not None else ssh
+    self._scp_to = scp_to_fn if scp_to_fn is not None else scp_to
+    self._scp_from = (scp_from_fn if scp_from_fn is not None
+                      else scp_from)
+    self._sudo = sudo
+
+  def capture(self, *, duration_s=15, log=print):
+    """Capture one handshake-init and stage it on the attacker.
+
+    Returns True on success; False if no handshake was seen.
+    """
+    if self.topo.attacker() is None:
+      return False
+    if not os.path.exists(WG_CAPTURE_LOCAL):
+      raise RuntimeError(
+          f"helper missing: {WG_CAPTURE_LOCAL}")
+    # Push the helper to the relay (where tcpdump will run) and
+    # to the attacker (which doesn't run capture but the helper
+    # is small; pushing it everywhere keeps redeploy idempotent).
+    if not self._scp_to(self.topo.relay_host, WG_CAPTURE_LOCAL,
+                        WG_CAPTURE_REMOTE):
+      raise RuntimeError(
+          f"scp wg_capture.py to {self.topo.relay_host} failed")
+    relay_pcap = "/tmp/wg_capture_handshake.bin"
+    self._ssh(self.topo.relay_host,
+              f"{self._sudo} rm -f {shlex.quote(relay_pcap)} "
+              "2>/dev/null; sleep 1",
+              timeout=10)
+    # Bounce wg0 on the legit sender so the relay sees a fresh
+    # handshake-init in the capture window.
+    log(f"capture: bouncing wg0 on {self.topo.sender()}")
+    self._ssh(self.topo.sender(),
+              f"{self._sudo} wg-quick down wg0 2>/dev/null; "
+              "sleep 1; "
+              f"{self._sudo} wg-quick up wg0 2>/dev/null",
+              timeout=30)
+    # Run capture in the foreground; tcpdump's -G/-W combo exits
+    # cleanly after `duration_s`.
+    log(f"capture: tcpdump on {self.topo.relay_host} "
+        f"for {duration_s}s")
+    rc, out, err = self._ssh(
+        self.topo.relay_host,
+        (f"python3 {WG_CAPTURE_REMOTE} "
+         f"--iface any --port {self.topo.relay_port} "
+         f"--out {shlex.quote(relay_pcap)} "
+         f"--timeout-s {duration_s} "
+         f"--sudo {shlex.quote(self._sudo)}"),
+        timeout=duration_s + 30)
+    if rc != 0 or "CAPTURE_OK" not in out:
+      log(f"capture failed: rc={rc} out={out[-200:]} "
+          f"err={err[-200:]}")
+      return False
+    # SCP the payload from relay to local, then to attacker. Two
+    # hops because we don't have direct relay→attacker SCP and the
+    # local builder doubles as a holding ground.
+    local_payload = "/tmp/_wg_handshake_local.bin"
+    if not self._scp_from(self.topo.relay_host, relay_pcap,
+                          local_payload):
+      log(f"scp from relay to local failed for {relay_pcap}")
+      return False
+    if not self._scp_to(self.topo.attacker(), local_payload,
+                        WG_HANDSHAKE_PAYLOAD):
+      log("scp from local to attacker failed")
+      return False
+    return True
+
+  # The LoadGenerator surface is unused for capture (it's not a
+  # parallel attack), but provided so a future stage could compose
+  # the capture as a pre-step inside `run_attack()`.
+  def prepare(self, point, run_id, out_dir):
+    self.capture(duration_s=int(point.get("duration_s", 15)))
+
+  def start(self, point, run_id, out_dir): pass
+  def wait(self, timeout): return True
+  def collect(self, point, run_id, out_dir): return []
+
+
 # -- WgRelayMode T1-hardening / integrity / restart-recovery --------
 
 
-def _hardening_specs(mode):
-  """Build the four T1 hardening AttackSpecs for this `mode`."""
+def _hardening_specs(mode, *, captured_handshake=False):
+  """Build the four T1 hardening AttackSpecs for this `mode`.
+
+  `captured_handshake=True` means a pre-captured WG handshake-init
+  payload is staged at `WG_HANDSHAKE_PAYLOAD` on the attacker —
+  the roaming-replay row uses it. When False, the roaming row is
+  emitted as a no-data row (capture step failed or wasn't run).
+  """
   from scenarios.attack import AttackSpec
 
-  victim_point = {"protocol": "udp", "rate_mbps": 1000,
-                  "duration_s": 30, "label": "victim-udp-1G"}
-
   def _make_victim():
-    """Fresh victim generator per row."""
-    return Iperf3SingleTunnelGen(mode.topo)
+    """Fresh victim generator per row, bound to a 1 G UDP point.
+
+    The mac1-forgery row's victim spec is "1 G UDP in parallel" —
+    that's what `RELEASE_BENCHMARK_SUITE.md` § T1 calls for.
+    """
+    return _BoundVictimGen(
+        Iperf3SingleTunnelGen(mode.topo),
+        victim_point={
+            "protocol": "udp",
+            "rate_mbps": 1000,
+            "msg_size": 1400,
+        })
 
   specs = []
-  for name, attack_mode, pps, evaluator in (
+  for name, attack_mode, pps, evaluator, with_victim in (
       ("hardening-mac1-forgery", "mac1-forgery", 10000,
-       _evaluate_mac1),
+       _evaluate_mac1, True),
       ("hardening-amplification-probe", "amplification", 10000,
-       _evaluate_amplification),
+       _evaluate_amplification, False),
       ("hardening-non-wg-shape", "non-wg", 100000,
-       _evaluate_non_wg),
+       _evaluate_non_wg, False),
   ):
     attacker = WgAttackGen(mode.topo)
-    # Wrap the attacker so the scenario passes the right kwargs.
     bound = _BoundAttackGen(attacker, attack_mode=attack_mode,
                             pps=pps)
     specs.append(AttackSpec(
         name=name,
         description=f"{attack_mode} @ {pps} pps for 30 s",
         attacker=bound,
-        victim=_make_victim() if name == "hardening-mac1-forgery"
-        else None,
+        victim=_make_victim() if with_victim else None,
         duration_s=30,
         counter_evaluator=evaluator,
+        stall_threshold_s=300))
+
+  if captured_handshake:
+    roaming_attacker = WgAttackGen(mode.topo)
+    roaming_bound = _BoundAttackGen(
+        roaming_attacker,
+        attack_mode="roaming-replay",
+        pps=1000,
+        payload_path=WG_HANDSHAKE_PAYLOAD)
+    specs.append(AttackSpec(
+        name="hardening-roaming-attack",
+        description=("replay captured handshake-init from "
+                     "off-path source @ 1 kpps for 30 s"),
+        attacker=roaming_bound,
+        victim=None,
+        duration_s=30,
+        counter_evaluator=_evaluate_roaming,
         stall_threshold_s=300))
   return specs
 
 
 class _BoundAttackGen(LoadGenerator):
-  """Adapter: bake `attack_mode` + `pps` into a WgAttackGen so it
-  presents a clean LoadGenerator surface to the attack harness.
+  """Adapter: bake `attack_mode` + `pps` (+ optional payload_path)
+  into a WgAttackGen so it presents a clean LoadGenerator surface
+  to the attack harness.
   """
 
-  def __init__(self, inner, *, attack_mode, pps):
+  def __init__(self, inner, *, attack_mode, pps,
+               payload_path=None):
     self._inner = inner
     self._attack_mode = attack_mode
     self._pps = pps
+    self._payload_path = payload_path
 
   def _augment(self, point):
     p = dict(point)
     p["attack_mode"] = self._attack_mode
     p["pps"] = self._pps
+    if self._payload_path is not None:
+      p["payload_path"] = self._payload_path
     return p
 
   def prepare(self, point, run_id, out_dir):
@@ -1056,7 +1214,42 @@ class _BoundAttackGen(LoadGenerator):
 
   def collect(self, point, run_id, out_dir):
     return self._inner.collect(self._augment(point), run_id,
-                               out_dir)
+                                out_dir)
+
+  def cleanup(self):
+    self._inner.cleanup()
+
+
+class _BoundVictimGen(LoadGenerator):
+  """Adapter: bake the victim's iperf3 point (protocol, rate_mbps,
+  parallel) into an Iperf3SingleTunnelGen so the harness's spec
+  point (just `duration_s` + `label`) doesn't bleed into iperf3
+  flag selection.
+  """
+
+  def __init__(self, inner, *, victim_point):
+    self._inner = inner
+    self._victim_point = victim_point
+
+  def _augment(self, point):
+    p = dict(self._victim_point)
+    # Spec-provided fields take precedence — duration_s in
+    # particular comes from the row's spec.
+    p.update(point)
+    return p
+
+  def prepare(self, point, run_id, out_dir):
+    self._inner.prepare(self._augment(point), run_id, out_dir)
+
+  def start(self, point, run_id, out_dir):
+    self._inner.start(self._augment(point), run_id, out_dir)
+
+  def wait(self, timeout):
+    return self._inner.wait(timeout)
+
+  def collect(self, point, run_id, out_dir):
+    return self._inner.collect(self._augment(point), run_id,
+                                out_dir)
 
   def cleanup(self):
     self._inner.cleanup()
@@ -1072,11 +1265,13 @@ def _add_t1_hardening(WgRelayMode):
   def t1_hardening(self, *, out_dir, log=print):
     """Run the four T1 hardening rows.
 
-    The roaming-attack row is intentionally surfaced as a stub —
-    real WG-handshake replay needs key material we don't have at
-    this layer; flagged in dev_log.md as a stage-5 design
-    question. Returns 4 result rows; the roaming row has
-    `status='not-implemented'`.
+    Roaming-attack uses capture-and-replay: the prepare step runs
+    `wg_capture.py` on the relay during a wg0 bounce on the legit
+    sender, scps the resulting 148-byte handshake-init to the
+    attacker, then the attack row replays it from off-path. If
+    capture fails (no handshake seen, helper missing) the roaming
+    row degrades to `status='no-data'`; the other three rows
+    still run.
     """
     if self.topo.attacker() is None:
       log("T1 hardening: no attacker host in topology — "
@@ -1089,7 +1284,18 @@ def _add_t1_hardening(WgRelayMode):
                         "hardening-roaming-attack")]
     rows = []
     os.makedirs(out_dir, exist_ok=True)
-    for spec in _hardening_specs(self):
+
+    log("T1 hardening: capturing legit handshake for roaming row")
+    captured = False
+    try:
+      captured = WgCaptureGen(self.topo).capture(
+          duration_s=15, log=log)
+    except Exception as e:
+      log(f"capture raised {type(e).__name__}: {e}; "
+          "roaming row will degrade")
+
+    for spec in _hardening_specs(self,
+                                  captured_handshake=captured):
       log(f"T1 hardening: {spec.name}")
       try:
         rows.append(run_attack(
@@ -1107,11 +1313,14 @@ def _add_t1_hardening(WgRelayMode):
             spec.victim.cleanup()
           except Exception:
             pass
-    rows.append({
-        "test": "hardening-roaming-attack",
-        "status": "not-implemented",
-        "reason": "needs WG-handshake capture-and-replay; "
-                  "stage-5 design question — see dev_log.md"})
+
+    if not captured:
+      rows.append({
+          "test": "hardening-roaming-attack",
+          "status": "no-data",
+          "reason": "wg handshake capture failed; check that "
+                    "tcpdump is installed and the legit peer "
+                    "can re-handshake within the capture window"})
     return rows
 
   def t1_integrity(self, *, out_dir, runs=3, log=print):
