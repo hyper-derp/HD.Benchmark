@@ -1,13 +1,21 @@
-"""cloud-gcp-c4: 1 relay + 4 clients in europe-west4-a, c4-highcpu-N.
+"""cloud-gcp-c4: 1 relay + 4 clients (+ optional attacker)
+in europe-west4-a, c4-highcpu-N.
 
 Topology:
-  relay   = bench-relay-ew4 (RELAY constant from lib.ssh)
-  clients = bench-client-{1..4}
-  tunnel  = 10.99.0.{1..4} on wg0
+  relay    = bench-relay-ew4 (RELAY constant from lib.ssh)
+  clients  = bench-client-{1..4}
+  tunnel   = 10.99.0.{1..4} on wg0
+  attacker = bench-attacker-ew4 (5th VM, off-path, T1 hardening)
 
 The relay listens on UDP/51820 (wg-relay default). The relay's
 private IP (RELAY_INTERNAL = 10.10.0.10) is what clients use as
 the WG `Endpoint = ...:51820` — bench-net is shared 10.10.0.0/24.
+
+The attacker is destructive scope (per the design's "Cloud-only
+(destructive, disposable VMs)" note). It's NOT in the wg roster
+and reaches the relay only via the public IP. ATTACKER_HOST may
+be set to None to skip T1 hardening rows; setup_release_suite
+will record a `note` and continue.
 """
 
 from lib.ssh import RELAY, CLIENTS, RELAY_INTERNAL, USER, SSH_KEY
@@ -36,6 +44,19 @@ TUNNEL_IPS = ["10.99.0.1", "10.99.0.2", "10.99.0.3", "10.99.0.4"]
 # them via `hdcli wg peer add`.
 PEER_NAMES = ["c1", "c2", "c3", "c4"]
 
+# Attacker host (5th VM, off-path). Set to None on platforms
+# without one; T1 hardening rows then degrade to no-data.
+# Provisioning is the running agent's job; this constant just
+# tells the framework whether to *expect* the host to be
+# reachable. Override via the env if you need a different VM.
+import os as _os
+ATTACKER_HOST = _os.environ.get(
+    "HD_BENCH_GCP_ATTACKER", "34.91.218.230")
+
+# NIC interface name on the GCP VMs (gVNIC). Used by the XDP
+# attach + queue-halving step.
+NIC_INTERFACE = "ens4"
+
 
 def wg_relay_topology():
   """Build the wg-relay `Topology` for this platform."""
@@ -44,7 +65,8 @@ def wg_relay_topology():
       relay_endpoint_ip=RELAY_INTERNAL,
       relay_port=51820,
       clients=list(CLIENTS),
-      tunnel_ips=list(TUNNEL_IPS))
+      tunnel_ips=list(TUNNEL_IPS),
+      attacker_host=ATTACKER_HOST)
 
 
 def relay_kwargs():

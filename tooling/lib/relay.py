@@ -90,6 +90,8 @@ class Relay:
                workers=0,
                metrics_port=9090,
                debug_endpoints=True,
+               xdp_interface=None,
+               xdp_bpf_obj_path=None,
                sudo="sudo"):
     """Construct a relay handle.
 
@@ -147,6 +149,8 @@ class Relay:
     self.workers = workers
     self.metrics_port = metrics_port
     self.debug_endpoints = debug_endpoints
+    self.xdp_interface = xdp_interface
+    self.xdp_bpf_obj_path = xdp_bpf_obj_path
     self.sudo = sudo
 
   # -- Lifecycle ----------------------------------------------------
@@ -263,6 +267,54 @@ class Relay:
     if not got.startswith(expected):
       raise RelayError(
           f"{self.host}: expected version {expected}, got {got}")
+
+  # -- XDP attach / detach (wireguard mode only) --------------------
+
+  def enable_xdp(self, interface, *,
+                 bpf_obj_path=None, halve_queues=True,
+                 timeout=30):
+    """Restart the daemon with XDP attached on `interface`.
+
+    `halve_queues=True` runs `sudo ethtool -L <iface> rx 1 tx 1`
+    first — the gve quirk from BENCHMARK_HISTORY.md (XDP attach
+    fails silently on multi-queue gve). Set False on Mellanox
+    where multi-queue XDP works.
+
+    Raises RelayError if the daemon comes back without
+    `xdp_attached=true` in `wg show`.
+    """
+    if self.mode != "wireguard":
+      raise RelayError(
+          f"enable_xdp only supported for mode='wireguard'; "
+          f"current mode is {self.mode!r}")
+    if halve_queues:
+      ssh(self.host,
+          f"{self.sudo} ethtool -L "
+          f"{shlex.quote(interface)} rx 1 tx 1 "
+          "2>/dev/null || true",
+          timeout=15)
+    self.xdp_interface = interface
+    self.xdp_bpf_obj_path = bpf_obj_path
+    if not self.restart(timeout=timeout):
+      raise RelayError(
+          f"{self.host}: relay failed to restart with XDP")
+    info = self.wg_show()
+    attached = info.get("xdp_attached", "false")
+    if attached != "true":
+      raise RelayError(
+          f"{self.host}: XDP attach didn't take "
+          f"(xdp_attached={attached!r}); check daemon logs")
+
+  def disable_xdp(self, *, timeout=30):
+    """Restart the daemon with XDP detached."""
+    if self.mode != "wireguard":
+      raise RelayError(
+          f"disable_xdp only supported for mode='wireguard'")
+    self.xdp_interface = None
+    self.xdp_bpf_obj_path = None
+    if not self.restart(timeout=timeout):
+      raise RelayError(
+          f"{self.host}: relay failed to restart without XDP")
 
   # -- TLS cert (derp / hd-protocol only) ---------------------------
 
@@ -577,6 +629,18 @@ def _render_yaml_config(relay):
         "wg_relay:",
         f"  port: {relay.port}",
         f"  roster_path: {relay.roster_path}",
+    ]
+    # XDP attach is opt-in via the wg_relay block. When the
+    # interface name is set the daemon brings the fast path up at
+    # startup; absent the line, it stays userspace-only. The bpf
+    # object path is optional — the daemon defaults to
+    # /usr/lib/hyper-derp/wg_relay.bpf.o (per src/wg_relay.cc).
+    if relay.xdp_interface:
+      lines.append(f"  xdp_interface: {relay.xdp_interface}")
+    if relay.xdp_bpf_obj_path:
+      lines.append(
+          f"  xdp_bpf_obj_path: {relay.xdp_bpf_obj_path}")
+    lines += [
         "einheit:",
         f"  ctl_endpoint: ipc://{EINHEIT_CTL}",
         f"  pub_endpoint: ipc://{EINHEIT_PUB}",

@@ -11,16 +11,23 @@ Usage:
                          [--state-dir <path>] [--keep-vms]
                          [--no-version-check]
 
-Stage-4 MVP scope:
-  - Reachability check (relay + every client).
+Scope:
+  - Reachability check (relay + every client; attacker if
+    platform.ATTACKER_HOST is set, optional).
   - Version verification via `lib.relay.Relay.verify_version()`.
   - Roster bootstrap (idempotent peer + link registration).
+  - Helper-binaries preflight on every host (tcpdump, nc,
+    iperf3, ethtool, ip; missing tools are warnings unless
+    --strict, in which case they fail).
+  - MTU check on wg0 (matches platform.WG_MTU when set).
+  - NIC-bandwidth preflight (iperf3 between two clients on the
+    bench-net for `--nic-bw-duration` seconds; sanity-check
+    against `platform.NIC_BW_MIN_GBPS` if defined).
   - Integration smoke (4/4 ping over the tunnel).
   - State file initialization at <state-dir>/state.json.
 
-Out-of-scope-for-stage-4 (added in later stages):
+Out-of-scope (later stages):
   - VM provisioning (cloud platform expects VMs already up).
-  - NIC bandwidth / MTU / queue-count preflight.
   - Soak / profile setup.
 """
 
@@ -47,6 +54,10 @@ def _abort(reason):
   sys.exit(1)
 
 
+REQUIRED_TOOLS = ("tcpdump", "iperf3", "ethtool", "ip", "wg")
+RECOMMENDED_TOOLS = ("nc", "sha256sum")
+
+
 def _check_reachable(hosts):
   """Verify SSH `true` works on every host. Returns first bad host."""
   for h in hosts:
@@ -63,6 +74,75 @@ def _ping_4_4(sender_host, target_ip, timeout=15):
       f"ping -c 4 -W 2 -q {target_ip}",
       timeout=timeout)
   return rc == 0
+
+
+def _check_tools(host, tools, timeout=10):
+  """Return (missing_required, missing_recommended) on `host`."""
+  cmd = " ; ".join(
+      f"command -v {t} >/dev/null 2>&1 && echo OK_{t} || echo MISS_{t}"
+      for t in tools)
+  rc, out, _ = ssh(host, cmd, timeout=timeout)
+  missing = []
+  for t in tools:
+    if f"OK_{t}" not in out:
+      missing.append(t)
+  return missing
+
+
+def _check_mtu(host, iface, expected, timeout=10):
+  """Return True if `iface`'s MTU on `host` equals `expected`.
+
+  Reads `ip -o link show <iface>`; tolerates the iface not being
+  up yet (returns True with a 'note' style message via stderr).
+  """
+  rc, out, _ = ssh(
+      host, f"ip -o link show {iface} 2>/dev/null", timeout=timeout)
+  if rc != 0 or not out.strip():
+    return None        # iface not present — caller may decide
+  for tok in out.split():
+    if tok == "mtu":
+      idx = out.split().index("mtu")
+      try:
+        actual = int(out.split()[idx + 1])
+      except (IndexError, ValueError):
+        return None
+      return actual == expected
+  return None
+
+
+def _nic_bandwidth_test(server_host, client_host, *,
+                        duration_s=5, port=5202, timeout=30):
+  """Quick iperf3 throughput check between two hosts. Returns
+  measured Mbps (float) or None on failure.
+
+  Uses the hosts' own routable IPs (not tunnel IPs) — exercises
+  the underlying NIC, not the relay. Per-platform expected
+  minimum is checked at the call site.
+  """
+  ssh(server_host,
+      f"/usr/bin/pkill -9 -x iperf3 2>/dev/null; "
+      f"setsid nohup iperf3 -s -1 -p {port} "
+      f"</dev/null >/dev/null 2>&1 & disown; sleep 1",
+      timeout=15)
+  rc, out, err = ssh(
+      client_host,
+      f"iperf3 -c {server_host} -p {port} -t {duration_s} "
+      f"-J 2>/dev/null",
+      timeout=timeout, no_tty=True)
+  if rc != 0:
+    return None
+  # Parse iperf3 JSON for receiver bps.
+  try:
+    import json as _json
+    data = _json.loads(out)
+    bps = (data.get("end", {}).get("sum_received", {})
+           .get("bits_per_second")
+           or data.get("end", {}).get("sum_sent", {})
+           .get("bits_per_second")
+           or 0)
+    return bps / 1e6
+  except (ValueError, KeyError):
+    return None
 
 
 def _default_state_dir(args):
@@ -98,6 +178,14 @@ def main(argv=None):
   p.add_argument("--no-version-check", action="store_true",
                  help="skip hyper-derp --version verification "
                  "(use only when the binary isn't deployed yet)")
+  p.add_argument("--strict", action="store_true",
+                 help="treat preflight warnings as setup failures "
+                 "(missing recommended tools, MTU mismatch, NIC "
+                 "bw below platform.NIC_BW_MIN_GBPS)")
+  p.add_argument("--skip-nic-bw", action="store_true",
+                 help="skip the NIC bandwidth preflight; useful "
+                 "when iperf3 between bench VMs would saturate "
+                 "the same path the actual benchmark needs")
   args = p.parse_args(argv)
 
   modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -115,12 +203,75 @@ def main(argv=None):
   state_dir = args.state_dir or _default_state_dir(args)
   os.makedirs(state_dir, exist_ok=True)
 
+  warnings = []
+  notes = []
+
   # 1. Reachability.
   topo = platform.wg_relay_topology()
   hosts = [topo.relay_host] + topo.clients
   bad, err = _check_reachable(hosts)
   if bad is not None:
     _abort(f"unreachable: {bad}: {err[:120]}")
+
+  attacker_ok = False
+  if topo.attacker() is not None:
+    bad_atk, err_atk = _check_reachable([topo.attacker()])
+    if bad_atk is not None:
+      msg = (f"attacker host {topo.attacker()} unreachable: "
+             f"{err_atk[:80]}")
+      if args.strict:
+        _abort(msg)
+      warnings.append(msg)
+      notes.append("T1 hardening rows will degrade to no-data")
+    else:
+      attacker_ok = True
+
+  # 2a. Helper-binaries preflight.
+  for h in hosts + ([topo.attacker()] if attacker_ok else []):
+    miss_req = _check_tools(h, REQUIRED_TOOLS)
+    miss_rec = _check_tools(h, RECOMMENDED_TOOLS)
+    if miss_req:
+      msg = (f"{h}: required tools missing: "
+             f"{', '.join(miss_req)}")
+      if args.strict:
+        _abort(msg)
+      warnings.append(msg)
+    if miss_rec:
+      warnings.append(
+          f"{h}: recommended tools missing: "
+          f"{', '.join(miss_rec)}")
+
+  # 2b. MTU on wg0 (when platform declares an expected value).
+  expected_mtu = getattr(platform, "WG_MTU", None)
+  if expected_mtu is not None:
+    for c in topo.clients:
+      ok = _check_mtu(c, "wg0", expected_mtu)
+      if ok is False:
+        msg = (f"{c}:wg0 MTU != {expected_mtu} "
+               "(gVNIC encap quirk; expect TCP throughput "
+               "collapse if wrong)")
+        if args.strict:
+          _abort(msg)
+        warnings.append(msg)
+      # ok is None means iface not up yet — don't fail.
+
+  # 2c. NIC bandwidth preflight (between two clients, off-tunnel).
+  if (not args.skip_nic_bw and len(topo.clients) >= 2):
+    measured = _nic_bandwidth_test(
+        topo.clients[0], topo.clients[1], duration_s=5)
+    min_gbps = getattr(platform, "NIC_BW_MIN_GBPS", None)
+    if measured is None:
+      warnings.append("NIC bandwidth preflight failed to "
+                      "produce a measurement")
+    else:
+      notes.append(f"NIC bw {measured/1000:.2f} Gbps "
+                   f"({topo.clients[0]} -> {topo.clients[1]})")
+      if min_gbps is not None and measured < min_gbps * 1000:
+        msg = (f"NIC bw {measured/1000:.2f} Gbps below "
+               f"platform.NIC_BW_MIN_GBPS={min_gbps}")
+        if args.strict:
+          _abort(msg)
+        warnings.append(msg)
 
   # 2. Build Relay handle. Verify daemon is running + version.
   relay = Relay(mode="wireguard", **platform.relay_kwargs())
@@ -163,9 +314,17 @@ def main(argv=None):
       tier=None,
       results_dir=results_dir,
       session_id=args.session_id)
+  for w in warnings:
+    state_mod.append_log(state_dir, "note",
+                         text=f"setup warning: {w}")
+  for n in notes:
+    state_mod.append_log(state_dir, "note",
+                         text=f"setup note: {n}")
   state_mod.append_log(
       state_dir, "setup-ok",
-      state_path=state_mod.state_path(state_dir))
+      state_path=state_mod.state_path(state_dir),
+      attacker_reachable=attacker_ok,
+      warning_count=len(warnings))
 
   _emit(f"SETUP_OK {state_mod.state_path(state_dir)}")
   return 0

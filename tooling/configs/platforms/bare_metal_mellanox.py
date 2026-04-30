@@ -37,6 +37,19 @@ PEER_NAMES = ["alice", "bob", "carol", "dave"]
 # NAT in front.
 RELAY_ENDPOINT_IP = "192.168.122.83"
 
+# Attacker host: a 5th libvirt VM if you've provisioned one.
+# Default None — the libvirt fleet doc only specifies relay + 4
+# clients. Set HD_BENCH_LIBVIRT_ATTACKER to the ssh_config alias
+# of a 5th VM to enable hardening rows.
+import os as _os
+ATTACKER_HOST = _os.environ.get(
+    "HD_BENCH_LIBVIRT_ATTACKER", None)
+
+# NIC interface used for XDP attach (Mellanox CX-4/5 on the
+# typical bare-metal fleet). Override per host if needed.
+NIC_INTERFACE = _os.environ.get(
+    "HD_BENCH_LIBVIRT_NIC", "enp1s0")
+
 
 def wg_relay_topology():
   """Build the wg-relay `Topology` for this platform."""
@@ -45,7 +58,8 @@ def wg_relay_topology():
       relay_endpoint_ip=RELAY_ENDPOINT_IP,
       relay_port=RELAY_PORT,
       clients=list(CLIENT_HOSTS),
-      tunnel_ips=list(TUNNEL_IPS))
+      tunnel_ips=list(TUNNEL_IPS),
+      attacker_host=ATTACKER_HOST)
 
 
 def relay_kwargs():

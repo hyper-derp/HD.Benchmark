@@ -74,6 +74,11 @@ def _build_argparser():
   p.add_argument("--skip-setup", action="store_true")
   p.add_argument("--no-version-check", action="store_true")
   p.add_argument("--session-id", default=None)
+  p.add_argument("--xdp", choices=("auto", "on", "off"),
+                 default="auto",
+                 help="XDP path policy. 'auto' = userspace then "
+                      "XDP if platform.NIC_INTERFACE is set; "
+                      "'on' = XDP only; 'off' = userspace only.")
   return p
 
 
@@ -145,6 +150,33 @@ def _stage_logger(state_dir, stage):
   def _log(s):
     state_mod.append_log(state_dir, "note", text=s, stage=stage)
   return _log
+
+
+def _platform_attr(args, name, default=None):
+  """Pull an optional attribute off the platform module."""
+  return getattr(get_platform(args.platform), name, default)
+
+
+def _attach_xdp_stage(relay, nic):
+  """Bring XDP up via `relay.enable_xdp(nic)`. Returns one row."""
+  try:
+    relay.enable_xdp(nic, halve_queues=True)
+    return [{"test": "xdp-attach", "status": "pass",
+             "interface": nic}]
+  except Exception as e:
+    return [{"test": "xdp-attach", "status": "fail",
+             "interface": nic,
+             "reason": f"{type(e).__name__}: {e}"}]
+
+
+def _detach_xdp_stage(relay):
+  """Tear XDP down via `relay.disable_xdp()`. Returns one row."""
+  try:
+    relay.disable_xdp()
+    return [{"test": "xdp-detach", "status": "pass"}]
+  except Exception as e:
+    return [{"test": "xdp-detach", "status": "fail",
+             "reason": f"{type(e).__name__}: {e}"}]
 
 
 def _run_t1_stage(state_dir, stage_name, stage_fn, *, relay_host):
@@ -237,13 +269,50 @@ def _run_tier(state_dir, args, tier, mode, results_dir):
     out_dir = os.path.join(results_dir, "wg-relay", "T1")
     os.makedirs(out_dir, exist_ok=True)
     rows = []
-    rows += _run_t1_stage(
-        state_dir, "t1-throughput",
-        lambda: mode.t1_throughput(
-            out_dir=out_dir, runs=_runs_default(args),
-            latency_runs=args.latency_runs, xdp=False,
-            log=_stage_logger(state_dir, "t1-throughput")),
-        relay_host=mode.relay.host)
+    nic = _platform_attr(args, "NIC_INTERFACE")
+
+    # Userspace pass.
+    if args.xdp != "on":
+      rows += _run_t1_stage(
+          state_dir, "t1-throughput-userspace",
+          lambda: mode.t1_throughput(
+              out_dir=os.path.join(out_dir, "userspace"),
+              runs=_runs_default(args),
+              latency_runs=args.latency_runs, xdp=False,
+              log=_stage_logger(state_dir,
+                                "t1-throughput-userspace")),
+          relay_host=mode.relay.host)
+
+    # XDP pass (when the platform names a NIC and policy allows).
+    do_xdp = (args.xdp != "off"
+              and nic is not None
+              and mode.relay.mode == "wireguard")
+    if do_xdp:
+      rows += _run_t1_stage(
+          state_dir, "t1-xdp-attach",
+          lambda: _attach_xdp_stage(mode.relay, nic),
+          relay_host=mode.relay.host)
+      try:
+        rows += _run_t1_stage(
+            state_dir, "t1-throughput-xdp",
+            lambda: mode.t1_throughput(
+                out_dir=os.path.join(out_dir, "xdp"),
+                runs=_runs_default(args),
+                latency_runs=args.latency_runs, xdp=True,
+                log=_stage_logger(state_dir,
+                                  "t1-throughput-xdp")),
+            relay_host=mode.relay.host)
+      finally:
+        _run_t1_stage(
+            state_dir, "t1-xdp-detach",
+            lambda: _detach_xdp_stage(mode.relay),
+            relay_host=mode.relay.host)
+    elif args.xdp != "off":
+      state_mod.append_log(
+          state_dir, "note",
+          text=("XDP pass skipped: platform.NIC_INTERFACE is "
+                "unset (no fast-path test for this platform)"))
+
     rows += _run_t1_stage(
         state_dir, "t1-hardening",
         lambda: mode.t1_hardening(
