@@ -69,13 +69,20 @@ class Topology:
 
   def __init__(self, relay_host, relay_endpoint_ip,
                relay_port, clients, tunnel_ips,
-               attacker_host=None):
+               attacker_host=None, multi_tunnel_pairs=None):
     """All-positional constructor — kwarg-only would force every
     test to spell out fields that are always passed in this order.
 
     `attacker_host`: optional 5th SSH host, off-path (not in the
     roster). Required for T1 hardening rows; T0 / T1-throughput
     don't need it. Defaults to None.
+
+    `multi_tunnel_pairs`: optional list of `lib.multi_tunnel
+    .TunnelPair` for the T1 multi-tunnel-aggregate row. When
+    set, `Iperf3MultiTunnelGen` runs N parallel iperf3 across
+    real independent tunnels (each with its own source 4-tuple
+    on the relay). When None / empty, falls back to iperf3
+    `-P N` on the default tunnel pair — the stage-3 first-cut.
     """
     if len(clients) != len(tunnel_ips):
       raise ValueError(
@@ -90,6 +97,7 @@ class Topology:
     self.clients = list(clients)
     self.tunnel_ips = list(tunnel_ips)
     self.attacker_host = attacker_host
+    self.multi_tunnel_pairs = list(multi_tunnel_pairs or [])
 
   def sender(self):
     """Default sender client (the iperf3 -c side)."""
@@ -363,20 +371,132 @@ class Iperf3SingleTunnelGen(LoadGenerator):
 
 
 class Iperf3MultiTunnelGen(Iperf3SingleTunnelGen):
-  """First-cut multi-tunnel: iperf3 -P N on one peer pair.
+  """Multi-tunnel aggregate.
 
-  TODO(stage-4+): true N independent tunnels needs N (privkey,
-  tunnel-IP) pairs on each client, ideally per-netns. Until
-  setup_release_suite.py provisions that, this generator
-  approximates "concurrent tunnels" with `-P N` on a single
-  tunnel — the daemon sees one source 4-tuple, so per-peer cache
-  effects are not exercised.
+  Two operating modes, picked at run time based on whether
+  `topology.multi_tunnel_pairs` is non-empty:
+
+  - **Real N tunnels** (preferred): spawns N parallel iperf3
+    invocations, one per provisioned tunnel pair. The relay sees
+    N distinct source 4-tuples and the per-peer cache scaling
+    target is genuinely exercised. Provisioning is done at
+    setup time via `lib.multi_tunnel.provision_tunnels`.
+
+  - **First-cut** (fallback when no pairs are provisioned):
+    iperf3 `-P N` on the default tunnel pair. The daemon sees
+    one source 4-tuple, so this approximates aggregate
+    throughput but doesn't surface per-peer effects. Result rows
+    in this mode carry `mode='single-pair-fallback'` so
+    reviewers know.
   """
 
+  def __init__(self, topology, *, ssh_fn=None, scp_fn=None):
+    super().__init__(topology, ssh_fn=ssh_fn, scp_fn=scp_fn)
+    self._instance_paths = []
+    self._mode = None
+    self._real_n = 0
+
+  def prepare(self, point, run_id, out_dir):
+    n = int(point.get("tunnels", point.get("parallel", 1)))
+    pairs = self.topo.multi_tunnel_pairs[:n]
+    if len(pairs) >= n and n > 0:
+      self._mode = "real"
+      self._real_n = n
+      # Start an iperf3 server per receiver-side tunnel.
+      _stop_iperf3(self.topo.receiver(), ssh_fn=self._ssh)
+      cmd = "; ".join(
+          f"setsid nohup iperf3 -s -1 -B {p.receiver_ip} "
+          f"-p {DEFAULT_IPERF3_PORT + p.idx} "
+          "</dev/null >/dev/null 2>&1 & disown"
+          for p in pairs)
+      cmd += "; sleep 2"
+      self._ssh(self.topo.receiver(), cmd, timeout=30)
+    else:
+      self._mode = "single-pair-fallback"
+      super().prepare(point, run_id, out_dir)
+
   def start(self, point, run_id, out_dir):
-    p = dict(point)
-    p["parallel"] = int(p.get("tunnels", p.get("parallel", 1)))
-    super().start(p, run_id, out_dir)
+    if self._mode == "real":
+      pairs = self.topo.multi_tunnel_pairs[:self._real_n]
+      duration_s = int(point.get("duration_s", 30))
+      protocol = point.get("protocol", "tcp")
+      rate_mbps = int(point.get("rate_mbps", 0))
+      self._instance_paths = []
+      remote_jsons = []
+      cmd_parts = []
+      for p in pairs:
+        rj = (f"/tmp/iperf3_mt_{run_id}_{p.idx}_"
+              f"{int(time.time() * 1000)}.json")
+        remote_jsons.append((p, rj))
+        flags = [
+            "iperf3",
+            f"-c {shlex.quote(p.receiver_ip)}",
+            f"-B {shlex.quote(p.sender_ip)}",
+            f"-p {DEFAULT_IPERF3_PORT + p.idx}",
+            f"-t {duration_s}",
+            "--json",
+            f"--logfile {shlex.quote(rj)}",
+        ]
+        if protocol == "udp":
+          flags.append("-u")
+          if rate_mbps > 0:
+            flags.append(f"-b {rate_mbps}M")
+          flags.append(f"-l {int(point.get('msg_size', 1400))}")
+        cmd_parts.append(
+            "(" + " ".join(flags) +
+            " </dev/null >/dev/null 2>&1 &)")
+      cmd_parts.append(
+          f"wait $(jobs -p) 2>/dev/null; "
+          f"sleep {duration_s + 5}")
+      payload = " ; ".join(cmd_parts)
+      rc, _, err = self._ssh(
+          self.topo.sender(), payload,
+          timeout=duration_s + 90, no_tty=True)
+      if rc != 0:
+        raise RuntimeError(f"multi-tunnel run failed: {err[:200]}")
+      self._remote_jsons = remote_jsons
+      self._point = point
+      self._wait_started = time.time()
+    else:
+      # First-cut path uses -P N on the default pair.
+      p2 = dict(point)
+      p2["parallel"] = int(
+          point.get("tunnels", point.get("parallel", 1)))
+      super().start(p2, run_id, out_dir)
+
+  def collect(self, point, run_id, out_dir):
+    if self._mode != "real":
+      return super().collect(point, run_id, out_dir)
+    instance_paths = []
+    for pair, rj in self._remote_jsons:
+      local = os.path.join(
+          out_dir, f"{run_id}_t{pair.idx}.json")
+      if not self._scp(self.topo.sender(), rj, local):
+        continue
+      try:
+        with open(local) as f:
+          text = f.read()
+      except OSError:
+        continue
+      parsed = _parse_iperf3_json(
+          text,
+          rate_mbps=int(self._point.get("rate_mbps", 0)),
+          duration_s=int(self._point.get("duration_s", 30)),
+          msg_size=int(self._point.get("msg_size", 1400)),
+          protocol=self._point.get("protocol", "tcp"))
+      if parsed is None:
+        continue
+      parsed["run_id"] = run_id
+      parsed["tunnel_idx"] = pair.idx
+      instance_path = os.path.join(
+          out_dir, f"{run_id}_c{pair.idx}.json")
+      with open(instance_path, "w") as f:
+        json.dump(parsed, f, indent=2)
+      instance_paths.append(instance_path)
+    return instance_paths
+
+  def cleanup(self):
+    super().cleanup()
 
 
 class WgUdpEchoBgGen(LoadGenerator):

@@ -186,6 +186,11 @@ def main(argv=None):
                  help="skip the NIC bandwidth preflight; useful "
                  "when iperf3 between bench VMs would saturate "
                  "the same path the actual benchmark needs")
+  p.add_argument("--multi-tunnel-count", type=int, default=0,
+                 help="provision N independent WG tunnels for "
+                 "the T1 multi-tunnel-aggregate row. 0 (default) "
+                 "skips provisioning — multi-tunnel falls back "
+                 "to iperf3 -P N on the default pair")
   args = p.parse_args(argv)
 
   modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -314,17 +319,50 @@ def main(argv=None):
       tier=None,
       results_dir=results_dir,
       session_id=args.session_id)
+  # Multi-tunnel provisioning (optional).
+  multi_tunnel_pairs = []
+  if args.multi_tunnel_count > 0:
+    from lib import multi_tunnel as mt
+    pairs = mt.plan_tunnels(args.multi_tunnel_count)
+    ok = mt.provision_tunnels(
+        relay=relay,
+        sender_host=topo.sender(),
+        receiver_host=topo.receiver(),
+        sender_endpoint_ip=topo.sender(),
+        receiver_endpoint_ip=topo.receiver(),
+        relay_endpoint_ip=topo.relay_endpoint_ip,
+        relay_port=topo.relay_port,
+        pairs=pairs)
+    if not ok:
+      msg = (f"multi-tunnel provisioning failed for "
+             f"{args.multi_tunnel_count} pairs")
+      if args.strict:
+        _abort(msg)
+      warnings.append(msg)
+    else:
+      multi_tunnel_pairs = [p.to_dict() for p in pairs]
+      notes.append(
+          f"multi-tunnel: provisioned "
+          f"{args.multi_tunnel_count} pairs")
+
   for w in warnings:
     state_mod.append_log(state_dir, "note",
                          text=f"setup warning: {w}")
   for n in notes:
     state_mod.append_log(state_dir, "note",
                          text=f"setup note: {n}")
+  # Persist multi-tunnel pairs into state.json so the driver
+  # can hand them to Topology(multi_tunnel_pairs=...).
+  if multi_tunnel_pairs:
+    state = state_mod.load_state(state_dir)
+    state["multi_tunnel_pairs"] = multi_tunnel_pairs
+    state_mod.write_state(state_dir, state)
   state_mod.append_log(
       state_dir, "setup-ok",
       state_path=state_mod.state_path(state_dir),
       attacker_reachable=attacker_ok,
-      warning_count=len(warnings))
+      warning_count=len(warnings),
+      multi_tunnel_count=len(multi_tunnel_pairs))
 
   _emit(f"SETUP_OK {state_mod.state_path(state_dir)}")
   return 0

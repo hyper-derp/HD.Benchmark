@@ -564,6 +564,13 @@ def main(argv=None):
   platform = get_platform(args.platform)
   relay = Relay(mode="wireguard", **platform.relay_kwargs())
   topo = platform.wg_relay_topology()
+  # If setup provisioned multi-tunnel pairs, hydrate the topology
+  # with them so Iperf3MultiTunnelGen runs the real path.
+  pair_dicts = state.get("multi_tunnel_pairs") or []
+  if pair_dicts:
+    from lib.multi_tunnel import TunnelPair
+    topo.multi_tunnel_pairs = [TunnelPair.from_dict(d)
+                                for d in pair_dicts]
   mode_handle = WgRelayMode(relay=relay, topology=topo)
 
   # 3. Run each planned tier.
