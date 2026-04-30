@@ -55,7 +55,10 @@ def _abort(reason):
 
 
 REQUIRED_TOOLS = ("tcpdump", "iperf3", "ethtool", "ip", "wg")
-RECOMMENDED_TOOLS = ("nc", "sha256sum")
+RECOMMENDED_TOOLS = ("nc", "sha256sum",
+                     # T3 capture path:
+                     "perf", "mpstat", "ss", "bpftool")
+DEFAULT_FLAMEGRAPH_PREFIX = "/opt/FlameGraph"
 
 
 def _check_reachable(hosts):
@@ -108,6 +111,34 @@ def _check_mtu(host, iface, expected, timeout=10):
         return None
       return actual == expected
   return None
+
+
+def _check_flamegraph(host, prefix, timeout=10):
+  """Return True iff `stackcollapse-perf.pl` and `flamegraph.pl`
+  are executable under `prefix` on `host`. False otherwise.
+  """
+  cmd = (f"test -x {prefix}/stackcollapse-perf.pl "
+         f"&& test -x {prefix}/flamegraph.pl "
+         f"&& echo FLAME_OK || echo FLAME_MISS")
+  rc, out, _ = ssh(host, cmd, timeout=timeout)
+  return "FLAME_OK" in out
+
+
+def _check_perf_event_paranoid(host, timeout=10):
+  """Read `kernel.perf_event_paranoid` and return its int value.
+
+  Anything > 1 means non-root `perf record` against another
+  process won't attach. The default on most distros is 4 — T3
+  capture under sudo works, but if the operator runs T3 without
+  privilege the captures will silently empty.
+  """
+  rc, out, _ = ssh(
+      host, "sysctl -n kernel.perf_event_paranoid",
+      timeout=timeout)
+  try:
+    return int(out.strip())
+  except (ValueError, AttributeError):
+    return None
 
 
 def _nic_bandwidth_test(server_host, client_host, *,
@@ -191,6 +222,11 @@ def main(argv=None):
                  "the T1 multi-tunnel-aggregate row. 0 (default) "
                  "skips provisioning — multi-tunnel falls back "
                  "to iperf3 -P N on the default pair")
+  p.add_argument("--flamegraph-prefix",
+                 default=DEFAULT_FLAMEGRAPH_PREFIX,
+                 help="path on the relay where Brendan Gregg's "
+                 "FlameGraph repo is installed. Empty string "
+                 "skips the T3 flame-graph preflight check.")
   args = p.parse_args(argv)
 
   modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -259,6 +295,23 @@ def main(argv=None):
           _abort(msg)
         warnings.append(msg)
       # ok is None means iface not up yet — don't fail.
+
+  # 2b'. FlameGraph + perf_event_paranoid (T3 enabling checks,
+  # warnings only — T3 is diagnostic and never gates).
+  if args.flamegraph_prefix:
+    if not _check_flamegraph(topo.relay_host,
+                              args.flamegraph_prefix):
+      warnings.append(
+          f"{topo.relay_host}: FlameGraph scripts not found at "
+          f"{args.flamegraph_prefix} — T3 captures will produce "
+          "perf.data + bpf snapshots but no flame.svg")
+  paranoid = _check_perf_event_paranoid(topo.relay_host)
+  if paranoid is not None and paranoid > 1:
+    warnings.append(
+        f"{topo.relay_host}: kernel.perf_event_paranoid="
+        f"{paranoid} (T3 perf record needs sudo; without it "
+        "captures will be empty). Set "
+        "`sysctl -w kernel.perf_event_paranoid=1` to relax")
 
   # 2c. NIC bandwidth preflight (between two clients, off-tunnel).
   if (not args.skip_nic_bw and len(topo.clients) >= 2):

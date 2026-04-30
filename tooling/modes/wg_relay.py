@@ -36,6 +36,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 import time
 
 from lib.ssh import ssh, scp_to, scp_from
@@ -1599,12 +1600,19 @@ def _add_t2_soak(WgRelayMode):
           log=log,
           evaluate_restart_cycle=evaluate_restart_cycle))
     if "trickle-roam" in sub_tests:
-      rows.append({
-          "test": "soak-trickle-roam",
-          "status": "not-implemented",
-          "reason": "stage-7 partial — needs per-platform "
-                    "wg-quick override + striker map size "
-                    "exposure on hdcli"})
+      # Production interval is 10 min (per the spec); scale down
+      # for shorter soaks so dev-mode runs actually fire roams.
+      roam_interval = min(600, max(5, duration_s // 6))
+      rows.append(_run_trickle_roam(
+          self, out_dir=out_dir, duration_s=duration_s,
+          sampling_interval_s=sampling_interval_s,
+          roam_interval_s=roam_interval,
+          roam_confirm_s=min(60, max(10, duration_s // 6)),
+          trickle_mbps=10,
+          log=log,
+          SoakSpec=SoakSpec, run_soak=run_soak,
+          default_sampler=default_sampler,
+          write_samples=write_samples))
     return rows
 
   WgRelayMode.t2_soak = t2_soak
@@ -1719,6 +1727,174 @@ def _run_restart_cycle(mode, *, out_dir, duration_s, interval_s,
     json.dump({"cycles": cycles, "details": evaluation["details"]},
               f, indent=2)
   return out
+
+
+def _run_trickle_roam(mode, *, out_dir, duration_s,
+                       sampling_interval_s, roam_interval_s,
+                       roam_confirm_s, trickle_mbps, log,
+                       SoakSpec, run_soak, default_sampler,
+                       write_samples):
+  """T2 trickle-roam: light UDP + periodic wg0 bounce on a 3rd
+  client, with ping-through-tunnel confirmation per roam.
+
+  Pass criteria asserted directly:
+    * peer_count stays at the bootstrap value through every
+      sample (no peer eviction)
+    * every roam confirms within `roam_confirm_s` (a ping
+      through the tunnel succeeds inside the window)
+
+  Pass criteria deferred (need daemon-side counters):
+    * striker / blocklist map size stays bounded — surfaced as
+      `striker_bounded: deferred` in the details.
+  """
+  if mode.topo.bg_sender() is None:
+    return {"test": "soak-trickle-roam",
+            "status": "no-data",
+            "reason": "topology has no bg_sender (need 4 "
+                      "clients) for the roaming peer"}
+
+  log(f"soak trickle-roam: {trickle_mbps} Mbps trickle, "
+      f"roam every {roam_interval_s}s, confirm window "
+      f"{roam_confirm_s}s, total {duration_s}s")
+  receiver = mode.topo.receiver()
+  sender = mode.topo.sender()
+  roam_client = mode.topo.bg_sender()
+  roam_target_ip = mode.topo.receiver_tunnel_ip()
+  initial_peer_count = int(
+      mode.relay.wg_show().get("peer_count", "0"))
+  roams = []
+  stop_roam = threading.Event()
+
+  def _trickle_start():
+    _stop_iperf3(receiver)
+    _start_iperf3_server(receiver, port=DEFAULT_IPERF3_PORT,
+                         duration_s=duration_s + 60)
+    cmd = (
+        f"setsid nohup iperf3 -c "
+        f"{shlex.quote(roam_target_ip)} "
+        f"-p {DEFAULT_IPERF3_PORT} -u -b {trickle_mbps}M "
+        f"-l 1400 -t {duration_s} "
+        "</dev/null >/dev/null 2>&1 & disown; sleep 1"
+    )
+    ssh(sender, cmd, timeout=20, no_tty=True)
+    _kick_off_roam_thread(_roam_loop)
+
+  def _trickle_stop():
+    stop_roam.set()
+    _stop_iperf3(sender)
+    _stop_iperf3(receiver)
+
+  def _roam_loop():
+    """Bounce wg0 on roam_client every roam_interval_s and
+    confirm via ping-through-tunnel.
+    """
+    next_at = time.time() + roam_interval_s
+    while not stop_roam.is_set():
+      sleep_for = next_at - time.time()
+      while sleep_for > 0 and not stop_roam.is_set():
+        time.sleep(min(0.5, sleep_for))
+        sleep_for = next_at - time.time()
+      if stop_roam.is_set():
+        return
+      idx = len(roams) + 1
+      log(f"  roam #{idx}: bouncing wg0 on {roam_client}")
+      ssh(roam_client,
+          "sudo wg-quick down wg0 2>/dev/null; sleep 1; "
+          "sudo wg-quick up wg0 2>/dev/null",
+          timeout=30, no_tty=True)
+      started = time.time()
+      confirmed_at = None
+      deadline = started + roam_confirm_s
+      while time.time() < deadline and not stop_roam.is_set():
+        rc, _, _ = ssh(roam_client,
+                        f"ping -c 1 -W 2 -q "
+                        f"{shlex.quote(roam_target_ip)}",
+                        timeout=5)
+        if rc == 0:
+          confirmed_at = time.time()
+          break
+        time.sleep(2)
+      roams.append({
+          "idx": idx,
+          "started_at": started,
+          "confirmed_at": confirmed_at,
+          "confirmed_within_s": (
+              round(confirmed_at - started, 2)
+              if confirmed_at is not None else None),
+          "status": ("pass" if confirmed_at is not None
+                     else "fail"),
+      })
+      next_at = time.time() + roam_interval_s
+
+  def _evaluate(samples, total_duration):
+    peer_drift = [
+        (s.get("t_s"), s.get("peer_count"))
+        for s in samples
+        if s.get("peer_count") is not None
+        and s.get("peer_count") != initial_peer_count
+    ]
+    confirmed = sum(1 for r in roams if r["status"] == "pass")
+    failed = [r for r in roams if r["status"] != "pass"]
+    details = {
+        "initial_peer_count": initial_peer_count,
+        "roams_attempted": len(roams),
+        "roams_confirmed": confirmed,
+        "peer_drift_events": len(peer_drift),
+        "max_confirm_within_s": max(
+            (r["confirmed_within_s"] for r in roams
+             if r["confirmed_within_s"] is not None),
+            default=None),
+        "striker_bounded": "deferred — daemon-side counter",
+    }
+    if peer_drift:
+      details["peer_drift_first"] = peer_drift[0]
+      return {"status": "fail",
+              "details": {**details,
+                          "reason":
+                          "peer_count drifted from initial "
+                          f"{initial_peer_count}"}}
+    if failed:
+      details["first_unconfirmed"] = failed[0]
+      return {"status": "fail",
+              "details": {**details,
+                          "reason":
+                          f"{len(failed)} roams unconfirmed "
+                          f"within {roam_confirm_s}s"}}
+    if not roams:
+      return {"status": "fail",
+              "details": {**details,
+                          "reason":
+                          "no roams attempted in window"}}
+    return {"status": "pass", "details": details}
+
+  spec = SoakSpec(
+      name="soak-trickle-roam",
+      duration_s=duration_s,
+      sampling_interval_s=sampling_interval_s,
+      sampler=default_sampler,
+      load_starter=_trickle_start,
+      load_stopper=_trickle_stop,
+      evaluator=_evaluate,
+      relay=mode.relay)
+  row, samples = run_soak(spec, log=log)
+  write_samples(
+      os.path.join(out_dir, "trickle_roam_samples.jsonl"),
+      samples)
+  with open(os.path.join(out_dir, "trickle_roam_roams.json"),
+            "w") as f:
+    json.dump({"roams": roams}, f, indent=2, default=str)
+  return row
+
+
+def _kick_off_roam_thread(target):
+  """Start `target` in a daemon thread.
+
+  Used by `_run_trickle_roam`'s `load_starter` so the roam loop
+  runs concurrently with the trickle iperf3 and the harness's
+  sampling thread.
+  """
+  t = threading.Thread(target=target, daemon=True)
+  t.start()
 
 
 _add_t2_soak(WgRelayMode)
