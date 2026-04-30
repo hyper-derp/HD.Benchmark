@@ -69,6 +69,23 @@ def wg_relay_topology():
       attacker_host=ATTACKER_HOST)
 
 
+def derp_topology():
+  """Build the DERP `DerpTopology`. Port 3340 is the daemon's
+  default for `mode: derp` / `mode: hd-protocol`.
+  """
+  from modes.derp import DerpTopology
+  return DerpTopology(
+      relay_host=RELAY,
+      relay_endpoint_ip=RELAY_INTERNAL,
+      relay_port=3340,
+      clients=list(CLIENTS))
+
+
+def hd_protocol_topology():
+  """HD-Protocol uses the same shape as DERP."""
+  return derp_topology()
+
+
 def relay_kwargs():
   """Build the kwargs for `lib.relay.Relay(...)` on this platform."""
   return {

@@ -165,6 +165,41 @@ def _log_run_start(state_dir, args, tier):
       budget_s=budget)
 
 
+def _build_mode_handle(mode_name, *, platform, state):
+  """Resolve `mode_name` to a (Relay, Topology, Mode) triple.
+
+  Stage 9 supports three names: 'wg-relay', 'derp',
+  'hd-protocol'. The platform module declares the topology
+  factory; the Mode class orchestrates the catalog rows. Future
+  modes plug in by adding (a) a `<name>_topology()` factory on
+  the platform module, and (b) a Mode class with `smoke()` /
+  `t1_throughput()` / etc.
+  """
+  if mode_name == "wg-relay":
+    relay = Relay(mode="wireguard", **platform.relay_kwargs())
+    topo = platform.wg_relay_topology()
+    pair_dicts = state.get("multi_tunnel_pairs") or []
+    if pair_dicts:
+      from lib.multi_tunnel import TunnelPair
+      topo.multi_tunnel_pairs = [TunnelPair.from_dict(d)
+                                  for d in pair_dicts]
+    return WgRelayMode(relay=relay, topology=topo)
+  if mode_name == "derp":
+    from modes.derp import DerpMode
+    relay = Relay(mode="derp", **platform.relay_kwargs())
+    topo = platform.derp_topology()
+    return DerpMode(relay=relay, topology=topo)
+  if mode_name == "hd-protocol":
+    from modes.hd_protocol import HdProtocolMode
+    relay = Relay(mode="hd-protocol",
+                  **platform.relay_kwargs())
+    topo = platform.hd_protocol_topology()
+    return HdProtocolMode(relay=relay, topology=topo)
+  raise ValueError(
+      f"unknown mode {mode_name!r}; expected wg-relay / derp / "
+      "hd-protocol")
+
+
 def _stage_logger(state_dir, stage):
   """Return a callable that appends `note` events for one stage."""
   def _log(s):
@@ -587,18 +622,19 @@ def main(argv=None):
                      f"~/dev/HD.Benchmark/tooling/results/"
                      f"{args.tag or 'dev'}/{args.platform}"))
 
-  # 2. Build mode handles.
+  # 2. Build mode handles. Stage-9 supports wg-relay / derp /
+  # hd-protocol; the dispatch is mode-name keyed so adding
+  # future modes is mechanical.
   platform = get_platform(args.platform)
-  relay = Relay(mode="wireguard", **platform.relay_kwargs())
-  topo = platform.wg_relay_topology()
-  # If setup provisioned multi-tunnel pairs, hydrate the topology
-  # with them so Iperf3MultiTunnelGen runs the real path.
-  pair_dicts = state.get("multi_tunnel_pairs") or []
-  if pair_dicts:
-    from lib.multi_tunnel import TunnelPair
-    topo.multi_tunnel_pairs = [TunnelPair.from_dict(d)
-                                for d in pair_dicts]
-  mode_handle = WgRelayMode(relay=relay, topology=topo)
+  modes_list = [m.strip() for m in args.modes.split(",")
+                if m.strip()]
+  if len(modes_list) != 1:
+    print(f"--modes must be exactly one mode for now; "
+          f"got {modes_list}", file=sys.stderr)
+    return 2
+  mode_name = modes_list[0]
+  mode_handle = _build_mode_handle(
+      mode_name, platform=platform, state=state)
 
   # 3. Run each planned tier.
   tier_results = {}

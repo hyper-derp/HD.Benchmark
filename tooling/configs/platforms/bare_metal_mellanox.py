@@ -62,6 +62,21 @@ def wg_relay_topology():
       attacker_host=ATTACKER_HOST)
 
 
+def derp_topology():
+  """Build the DERP `DerpTopology` for this platform."""
+  from modes.derp import DerpTopology
+  return DerpTopology(
+      relay_host=RELAY_HOST,
+      relay_endpoint_ip=RELAY_ENDPOINT_IP,
+      relay_port=3340,
+      clients=list(CLIENT_HOSTS))
+
+
+def hd_protocol_topology():
+  """HD-Protocol shares DERP's topology shape."""
+  return derp_topology()
+
+
 def relay_kwargs():
   """Build the kwargs for `lib.relay.Relay(...)` on this platform."""
   return {
