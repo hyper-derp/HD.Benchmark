@@ -501,6 +501,33 @@ def _emit_regression_diff(*, state_dir, results_dir, args,
   state_mod.append_log(
       state_dir, "note",
       text=f"regression verdict vs {prev_tag}: {verdict}")
+
+  # T3 attribution diff: if the prev tag captured T3 folded
+  # stacks AND the current run did too, render the per-symbol
+  # diff alongside the throughput/loss diff.
+  prev_t3 = os.path.join(
+      os.path.dirname(args.prev_results), "wg-relay", "T3")
+  curr_t3 = os.path.join(results_dir, "wg-relay", "T3")
+  if os.path.isdir(prev_t3) and os.path.isdir(curr_t3):
+    from scenarios.profile import t3_attribution_diff
+    t3_diff_path = os.path.join(
+        curr_t3, f"diff_vs_{prev_tag}.md")
+    try:
+      ok = t3_attribution_diff(prev_t3, curr_t3, t3_diff_path)
+    except Exception as e:
+      state_mod.append_log(
+          state_dir, "note",
+          text=f"T3 attribution diff failed: "
+               f"{type(e).__name__}: {e}")
+    else:
+      if ok:
+        state_mod.append_log(
+            state_dir, "report-written", path=t3_diff_path)
+      else:
+        state_mod.append_log(
+            state_dir, "note",
+            text="T3 attribution diff produced no symbol "
+                 "movement (skipped or first capture)")
   return diff_path
 
 

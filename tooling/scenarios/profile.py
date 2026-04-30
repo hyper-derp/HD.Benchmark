@@ -231,26 +231,38 @@ def _drive_captures(*, relay, ssh_mod, pid, duration_s, sudo,
 
 def _render_flame_graph(*, relay, ssh_mod, perf_data, out_dir,
                          op_name, flamegraph_prefix, sudo, log):
-  """Optional: render a flame graph from perf.data on the relay.
+  """Optional: render a flame graph + collapsed stacks from
+  perf.data on the relay.
 
-  Returns the local path to flame.svg on success, None otherwise.
+  Saves both `<op>.svg` (the flame graph) and `<op>.folded` (the
+  intermediate `stackcollapse-perf.pl` output, used as the input
+  to `t3_attribution_diff`). Returns the local SVG path on
+  success, None when FlameGraph isn't available.
   """
   if perf_data is None:
     return None
   collapse = os.path.join(flamegraph_prefix,
                             "stackcollapse-perf.pl")
   flame = os.path.join(flamegraph_prefix, "flamegraph.pl")
+  remote_folded = "/tmp/_t3_flame.folded"
   remote_svg = "/tmp/_t3_flame.svg"
+  # Two-step pipeline: keep the folded text on disk so the
+  # attribution diff in the next-tag run can read it.
   cmd = (
       f"test -x {collapse} && test -x {flame} && "
       f"{sudo} perf script -i {perf_data} "
-      f"| {collapse} | {flame} > {remote_svg} 2>/dev/null"
+      f"| {collapse} > {remote_folded} 2>/dev/null && "
+      f"cat {remote_folded} | {flame} > {remote_svg} 2>/dev/null"
   )
   rc, _, _ = ssh_mod.ssh(relay.host, cmd, timeout=120)
   if rc != 0:
     return None
   local_svg = os.path.join(out_dir, f"{op_name}.svg")
-  if not _scp_back(relay, remote_svg, local_svg, ssh_mod):
+  local_folded = os.path.join(out_dir, f"{op_name}.folded")
+  ok_svg = _scp_back(relay, remote_svg, local_svg, ssh_mod)
+  ok_folded = _scp_back(relay, remote_folded, local_folded,
+                         ssh_mod)
+  if not (ok_svg and ok_folded):
     return None
   return local_svg
 
@@ -261,24 +273,171 @@ def _scp_back(relay, remote_path, local_path, ssh_mod):
   return ssh_mod.scp_from(relay.host, remote_path, local_path)
 
 
-def t3_attribution_diff(prev_dir, curr_dir, out_path):
-  """Stub for the per-tag attribution diff (design § T3).
+def parse_folded(path):
+  """Parse a `stackcollapse-perf.pl` output file.
 
-  The full diff is "which function got hotter, which BPF prog
-  took longer". A real implementation reads the per-symbol
-  perf-script output, computes the % delta per symbol vs. the
-  prior tag's collapsed stacks, ranks by absolute change, and
-  renders markdown. Stage-8 MVP ships the capture; the diff is
-  surfaced here as a TODO so the running agent has a hook.
-
-  Returns False (not implemented) so callers can decide how to
-  surface that.
+  Each line is `func1;func2;...;leaf <count>`. Returns a list
+  of `(stack_path_str, count)` tuples. Tolerates blank lines
+  and malformed entries.
   """
+  out = []
+  with open(path) as f:
+    for line in f:
+      line = line.strip()
+      if not line:
+        continue
+      idx = line.rfind(" ")
+      if idx <= 0:
+        continue
+      try:
+        count = int(line[idx + 1:])
+      except ValueError:
+        continue
+      stack = line[:idx]
+      out.append((stack, count))
+  return out
+
+
+def aggregate_by_leaf(folded):
+  """Sum counts per leaf symbol (last name in the stack path).
+
+  Skips obvious noise: `[unknown]`, hex addresses, empty leaves.
+  Returns `{leaf_symbol: total_count}`.
+  """
+  totals = {}
+  for stack, count in folded:
+    leaf = stack.rsplit(";", 1)[-1]
+    leaf = leaf.strip()
+    if not leaf:
+      continue
+    if leaf.startswith("0x") or leaf == "[unknown]":
+      continue
+    totals[leaf] = totals.get(leaf, 0) + count
+  return totals
+
+
+def diff_attribution(prev_path, curr_path, *, top_n=25,
+                     min_delta_count=10):
+  """Read a pair of folded files; return ranked attribution rows.
+
+  Each row: {symbol, prev, curr, delta, delta_pct, kind}
+  where `kind` is 'hotter' / 'cooler' / 'new' / 'gone'.
+  `top_n` rows are returned, sorted by `abs(delta_pct)`
+  descending. Symbols whose `abs(delta) < min_delta_count` are
+  filtered to keep the table focused on real movement.
+  """
+  prev = aggregate_by_leaf(parse_folded(prev_path))
+  curr = aggregate_by_leaf(parse_folded(curr_path))
+  rows = []
+  for sym in set(prev) | set(curr):
+    p = prev.get(sym, 0)
+    c = curr.get(sym, 0)
+    delta = c - p
+    if abs(delta) < min_delta_count:
+      continue
+    if p == 0:
+      kind = "new"
+      delta_pct = float("inf")
+    elif c == 0:
+      kind = "gone"
+      delta_pct = -100.0
+    else:
+      delta_pct = (c - p) / p * 100.0
+      kind = "hotter" if delta > 0 else "cooler"
+    rows.append({
+        "symbol": sym, "prev": p, "curr": c,
+        "delta": delta, "delta_pct": delta_pct, "kind": kind,
+    })
+  # Rank: finite movements first (sorted by abs(delta_pct)
+  # descending), then 'new' / 'gone' rows at the bottom sorted
+  # by absolute count delta.
+  rows.sort(key=lambda r: (
+      1 if r["delta_pct"] == float("inf") else 0,
+      -abs(r["delta_pct"]) if r["delta_pct"] != float("inf")
+      else -abs(r["delta"])))
+  return rows[:top_n]
+
+
+def t3_attribution_diff(prev_dir, curr_dir, out_path, *,
+                        top_n=25):
+  """Render per-op attribution diff markdown.
+
+  Walks the operating-point subdirs in both `prev_dir` and
+  `curr_dir`, finds matching `<op>/<op>.folded` files, runs
+  `diff_attribution` per op. Rendered markdown groups by op
+  and lists the top-N hotter-or-cooler symbols.
+
+  Returns True iff at least one op produced data; False when
+  no folded files were found in either side (the typical
+  "first tag, no prior" case).
+  """
+  prev_ops = _ops_with_folded(prev_dir)
+  curr_ops = _ops_with_folded(curr_dir)
+  if not curr_ops:
+    with open(out_path, "w") as f:
+      f.write("# T3 attribution diff — no current data\n")
+    return False
+
+  lines = [
+      f"# T3 attribution diff",
+      "",
+      f"Prev: `{prev_dir}`  ",
+      f"Curr: `{curr_dir}`  ",
+      "",
+  ]
+  any_data = False
+  for op in sorted(set(prev_ops) | set(curr_ops)):
+    lines.append(f"## {op}")
+    lines.append("")
+    if op not in prev_ops:
+      lines.append("_no prev folded — first capture for this "
+                    "operating point._")
+      lines.append("")
+      continue
+    if op not in curr_ops:
+      lines.append("_no curr folded — operating point dropped "
+                    "this run._")
+      lines.append("")
+      continue
+    rows = diff_attribution(prev_ops[op], curr_ops[op],
+                             top_n=top_n)
+    if not rows:
+      lines.append(f"_no symbol moved by ≥ 10 samples; top {top_n} "
+                    "filtered out._")
+      lines.append("")
+      continue
+    any_data = True
+    lines.append("| symbol | prev | curr | Δ | Δ % | kind |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | --- |")
+    for r in rows:
+      pct = ("+∞" if r["delta_pct"] == float("inf")
+             else f"{r['delta_pct']:+.1f} %")
+      lines.append(
+          f"| `{r['symbol']}` | {r['prev']} | {r['curr']} | "
+          f"{r['delta']:+d} | {pct} | {r['kind']} |")
+    lines.append("")
   with open(out_path, "w") as f:
-    f.write("# T3 attribution diff — not implemented\n\n"
-            "The capture happened; the diff isn't built yet.\n"
-            "See dev_log.md stage-8 entry.\n")
-  return False
+    f.write("\n".join(lines) + "\n")
+  return any_data
+
+
+def _ops_with_folded(dir_path):
+  """Return `{op_name: folded_path}` for ops with a folded file.
+
+  Looks for `<dir>/<op>/<op>.folded` per the layout
+  scenarios/profile.py emits. Tolerates missing or empty dirs.
+  """
+  out = {}
+  if not os.path.isdir(dir_path):
+    return out
+  for entry in sorted(os.listdir(dir_path)):
+    op_dir = os.path.join(dir_path, entry)
+    if not os.path.isdir(op_dir):
+      continue
+    folded = os.path.join(op_dir, f"{entry}.folded")
+    if os.path.exists(folded) and os.path.getsize(folded) > 0:
+      out[entry] = folded
+  return out
 
 
 __all__ = ["ProfileSpec", "run_profile",
