@@ -1602,3 +1602,121 @@ def _run_restart_cycle(mode, *, out_dir, duration_s, interval_s,
 
 
 _add_t2_soak(WgRelayMode)
+
+
+# -- T3 (profile) orchestrator -----------------------------------
+
+
+def _add_t3_profile(WgRelayMode):
+  """Inject `t3_profile` onto WgRelayMode."""
+  from scenarios.profile import ProfileSpec, run_profile
+
+  def t3_profile(self, *, out_dir, capture_duration_s=30,
+                 flamegraph_prefix="/opt/FlameGraph",
+                 cap_mbps=None, log=print):
+    """Run the three T3 operating points.
+
+    Args:
+      out_dir: per-tier output directory.
+      capture_duration_s: how long perf record runs at each
+        operating point. Per design: 30 s.
+      flamegraph_prefix: where Brendan Gregg's FlameGraph repo
+        lives on the relay. None → skip flame rendering.
+      cap_mbps: peak observed throughput (Mbps) from T1; used
+        to size the multi-tunnel point. When None, defaults
+        to 2000 Mbps.
+      log: per-line logger.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cap_mbps = cap_mbps if cap_mbps is not None else 2000
+    rows = []
+    for spec in _profile_specs(self, capture_duration_s,
+                                cap_mbps):
+      row = run_profile(
+          spec, relay=self.relay, out_dir=out_dir,
+          flamegraph_prefix=flamegraph_prefix,
+          log=log)
+      rows.append(row)
+    return rows
+
+  WgRelayMode.t3_profile = t3_profile
+
+
+def _profile_specs(mode, capture_duration_s, cap_mbps):
+  """Build ProfileSpecs for the three T3 operating points."""
+  from scenarios.profile import ProfileSpec
+  receiver = mode.topo.receiver()
+  sender = mode.topo.sender()
+
+  def _udp_op_starter(rate_mbps):
+    def _start():
+      _stop_iperf3(receiver)
+      _start_iperf3_server(receiver, port=DEFAULT_IPERF3_PORT,
+                           duration_s=capture_duration_s + 60)
+      cmd = (
+          f"setsid nohup iperf3 -c "
+          f"{shlex.quote(mode.topo.receiver_tunnel_ip())} "
+          f"-p {DEFAULT_IPERF3_PORT} -u -b {rate_mbps}M "
+          f"-l 1400 -t {capture_duration_s + 30} "
+          "</dev/null >/dev/null 2>&1 & disown; sleep 1"
+      )
+      ssh(sender, cmd, timeout=20, no_tty=True)
+    return _start
+
+  def _tcp_op_starter():
+    def _start():
+      _stop_iperf3(receiver)
+      _start_iperf3_server(receiver, port=DEFAULT_IPERF3_PORT,
+                           duration_s=capture_duration_s + 60)
+      cmd = (
+          f"setsid nohup iperf3 -c "
+          f"{shlex.quote(mode.topo.receiver_tunnel_ip())} "
+          f"-p {DEFAULT_IPERF3_PORT} "
+          f"-t {capture_duration_s + 30} "
+          "</dev/null >/dev/null 2>&1 & disown; sleep 1"
+      )
+      ssh(sender, cmd, timeout=20, no_tty=True)
+    return _start
+
+  def _multi_tunnel_starter(parallel):
+    def _start():
+      _stop_iperf3(receiver)
+      _start_iperf3_server(receiver, port=DEFAULT_IPERF3_PORT,
+                           duration_s=capture_duration_s + 60)
+      cmd = (
+          f"setsid nohup iperf3 -c "
+          f"{shlex.quote(mode.topo.receiver_tunnel_ip())} "
+          f"-p {DEFAULT_IPERF3_PORT} -P {parallel} "
+          f"-t {capture_duration_s + 30} "
+          "</dev/null >/dev/null 2>&1 & disown; sleep 1"
+      )
+      ssh(sender, cmd, timeout=20, no_tty=True)
+    return _start
+
+  def _stopper():
+    _stop_iperf3(sender)
+    _stop_iperf3(receiver)
+
+  return [
+      ProfileSpec(
+          name="1g-udp",
+          load_starter=_udp_op_starter(1000),
+          load_stopper=_stopper,
+          capture_duration_s=capture_duration_s,
+          description="UDP @ 1 Gbps single tunnel"),
+      ProfileSpec(
+          name="peak-tcp-single",
+          load_starter=_tcp_op_starter(),
+          load_stopper=_stopper,
+          capture_duration_s=capture_duration_s,
+          description="TCP single-stream peak"),
+      ProfileSpec(
+          name="peak-multi-tunnel",
+          load_starter=_multi_tunnel_starter(50),
+          load_stopper=_stopper,
+          capture_duration_s=capture_duration_s,
+          description="iperf3 -P 50 (multi-tunnel first-cut)"),
+  ]
+
+
+_add_t3_profile(WgRelayMode)

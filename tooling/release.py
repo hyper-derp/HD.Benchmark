@@ -91,6 +91,14 @@ def _build_argparser():
   p.add_argument("--soak-interval", default=None,
                  help="Sampling interval for the continuous "
                       "soak. Defaults: 60s tagged, 5s dev.")
+  p.add_argument("--profile-duration", default=None,
+                 help="T3 perf-record duration per operating "
+                      "point. Defaults: 30s tagged, 5s dev.")
+  p.add_argument("--flamegraph-prefix",
+                 default="/opt/FlameGraph",
+                 help="Path on the relay where Brendan Gregg's "
+                      "FlameGraph repo lives. Set to '' to "
+                      "skip flame rendering.")
   return p
 
 
@@ -189,6 +197,24 @@ def _detach_xdp_stage(relay):
   except Exception as e:
     return [{"test": "xdp-detach", "status": "fail",
              "reason": f"{type(e).__name__}: {e}"}]
+
+
+def _run_tier_t3(state_dir, args, mode, results_dir):
+  """Drive the T3 profile capture. Three operating points; the
+  tier never gates per the design — diagnostic output only."""
+  from scenarios.soak import parse_duration
+  out_dir = os.path.join(results_dir, "wg-relay", "T3")
+  os.makedirs(out_dir, exist_ok=True)
+  duration_s = parse_duration(
+      args.profile_duration or ("5s" if args.dev else "30s"))
+  return _run_t1_stage(
+      state_dir, "t3-profile",
+      lambda: mode.t3_profile(
+          out_dir=out_dir,
+          capture_duration_s=duration_s,
+          flamegraph_prefix=args.flamegraph_prefix or None,
+          log=_stage_logger(state_dir, "t3-profile")),
+      relay_host=mode.relay.host)
 
 
 def _run_tier_t2(state_dir, args, mode, results_dir):
@@ -369,11 +395,12 @@ def _run_tier(state_dir, args, tier, mode, results_dir):
   if tier == "T2":
     return _run_tier_t2(state_dir, args, mode, results_dir)
 
-  # T3: stage 8 deliverable; log + skip.
+  if tier == "T3":
+    return _run_tier_t3(state_dir, args, mode, results_dir)
+
   state_mod.append_log(
       state_dir, "note",
-      text=(f"{tier} not implemented yet; "
-            "skipping. Stage 8 will fill this."))
+      text=f"{tier} not implemented; skipping.")
   return rows
 
 
