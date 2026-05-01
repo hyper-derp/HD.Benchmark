@@ -131,9 +131,24 @@ def _check_perf_event_paranoid(host, timeout=10):
   process won't attach. The default on most distros is 4 — T3
   capture under sudo works, but if the operator runs T3 without
   privilege the captures will silently empty.
+
+  Prefers `/proc/sys/kernel/perf_event_paranoid` (universally
+  available on Linux) over `sysctl` (procps, not always
+  installed). Returns None if neither path produced a sane int.
   """
+  # /proc path first — works on every Linux host.
   rc, out, _ = ssh(
-      host, "sysctl -n kernel.perf_event_paranoid",
+      host,
+      "cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null",
+      timeout=timeout)
+  if rc == 0:
+    try:
+      return int(out.strip())
+    except (ValueError, AttributeError):
+      pass
+  # Fall back to sysctl when /proc read failed (unusual).
+  rc, out, _ = ssh(
+      host, "sysctl -n kernel.perf_event_paranoid 2>/dev/null",
       timeout=timeout)
   try:
     return int(out.strip())

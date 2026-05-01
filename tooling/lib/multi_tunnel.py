@@ -235,8 +235,10 @@ def _provision_iface_batch(ssh_fn, host, sudo, specs, *, log):
     parts.append(
         f"{sudo} ip link del {iface} 2>/dev/null; "
         f"{sudo} ip link add {iface} type wireguard 2>/dev/null && "
-        f"{sudo} sh -c 'wg genkey > /tmp/{iface}.priv' && "
-        f"{sudo} chmod 600 /tmp/{iface}.priv && "
+        # umask 077 silences the `wg genkey > file` warning about
+        # world-accessible private-key files.
+        f"{sudo} sh -c 'umask 077 && wg genkey > /tmp/{iface}.priv' "
+        "&& "
         f"{sudo} wg set {iface} private-key /tmp/{iface}.priv "
         f"listen-port {port} && "
         f"{sudo} ip addr add {addr}/30 dev {iface} 2>/dev/null; "
