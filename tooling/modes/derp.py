@@ -96,10 +96,13 @@ class _ScaleTestGen(LoadGenerator):
 
   def prepare(self, point, run_id, out_dir):
     self._client_outputs = []
-    # Kill any stale scale-test processes; idempotent.
+    # Kill any stale scale-test processes. `-x` matches the
+    # binary name only — `-f scale-test` would self-match the
+    # parent shell's argv and kill our SSH session.
+    bin_name = os.path.basename(self._bin)
     for c in self.topo.clients:
       self._ssh(c,
-                "/usr/bin/pkill -9 -f scale-test 2>/dev/null; "
+                f"/usr/bin/pkill -9 -x {bin_name} 2>/dev/null; "
                 "sleep 1",
                 timeout=10)
 
@@ -153,7 +156,11 @@ class _ScaleTestGen(LoadGenerator):
   def cleanup(self):
     for c in self.topo.clients:
       self._ssh(c,
-                "/usr/bin/pkill -9 -f scale-test 2>/dev/null",
+                # `-x` matches the binary name exactly (not the full argv),
+                # so this won't self-match the parent shell's
+                # `pkill ... scale-test` command line.
+                f"/usr/bin/pkill -9 -x "
+                f"{os.path.basename(self._bin)} 2>/dev/null",
                 timeout=5)
 
   def liveness_command(self):
@@ -202,7 +209,9 @@ class _DerpEchoGen(LoadGenerator):
     disconnects — a stale echo confuses the next ping's warmup).
     """
     self._ssh(self.topo.receiver(),
-              "/usr/bin/pkill -9 -f derp-test-client 2>/dev/null; "
+              # `-x` matches the binary name; `-f` would
+              # self-match the parent shell's argv.
+              "/usr/bin/pkill -9 -x derp-test-client 2>/dev/null; "
               "sleep 1; rm -f /tmp/echo_key.txt",
               timeout=15)
     self._ssh(
@@ -232,7 +241,7 @@ class _DerpEchoGen(LoadGenerator):
 
   def stop_echo(self):
     self._ssh(self.topo.receiver(),
-              "/usr/bin/pkill -9 -f derp-test-client 2>/dev/null",
+              "/usr/bin/pkill -9 -x derp-test-client 2>/dev/null",
               timeout=5)
 
 
@@ -326,9 +335,10 @@ class DerpLatencyBgGen(LoadGenerator):
     self._extra = extra_flags
 
   def prepare(self, point, run_id, out_dir):
+    bin_name = os.path.basename(self._bin)
     for c in self.topo.bg_clients():
       self._ssh(c,
-                "/usr/bin/pkill -9 -f scale-test 2>/dev/null; "
+                f"/usr/bin/pkill -9 -x {bin_name} 2>/dev/null; "
                 "sleep 1",
                 timeout=10)
 
@@ -367,7 +377,11 @@ class DerpLatencyBgGen(LoadGenerator):
   def cleanup(self):
     for c in self.topo.bg_clients():
       self._ssh(c,
-                "/usr/bin/pkill -9 -f scale-test 2>/dev/null",
+                # `-x` matches the binary name exactly (not the full argv),
+                # so this won't self-match the parent shell's
+                # `pkill ... scale-test` command line.
+                f"/usr/bin/pkill -9 -x "
+                f"{os.path.basename(self._bin)} 2>/dev/null",
                 timeout=5)
 
 

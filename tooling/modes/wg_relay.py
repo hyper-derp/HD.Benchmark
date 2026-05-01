@@ -584,7 +584,15 @@ class WgUdpPingGen(LoadGenerator):
     # listener binds to all interfaces; we direct the ping client
     # at the receiver's tunnel IP to ensure it traverses the relay.
     self._ssh(self.topo.receiver(),
-              f"/usr/bin/pkill -9 -f wg_udp_ping.py 2>/dev/null; "
+              # Anchored pattern — `pkill -f wg_udp_ping.py`
+              # would self-match the parent shell's argv on
+              # remotes that wrap our SSH command in `sh -c`,
+              # killing the launching session. The `^python3 `
+              # anchor forces the regex to match only processes
+              # whose argv starts with python3, which the parent
+              # shell's argv does not.
+              f"/usr/bin/pkill -9 -f "
+              f"'^python3 /tmp/wg_udp_ping.py' 2>/dev/null; "
               f"sleep 1; "
               f"setsid nohup python3 {WG_UDP_PING_REMOTE} "
               f"--mode echo --listen 0.0.0.0 --port {self._port} "
@@ -626,7 +634,8 @@ class WgUdpPingGen(LoadGenerator):
 
   def cleanup(self):
     self._ssh(self.topo.receiver(),
-              "/usr/bin/pkill -9 -f wg_udp_ping.py 2>/dev/null",
+              "/usr/bin/pkill -9 -f '^python3 /tmp/wg_udp_ping.py' "
+"2>/dev/null",
               timeout=5)
 
 
@@ -910,8 +919,9 @@ class WgAttackGen(LoadGenerator):
       raise RuntimeError(
           f"scp helper to {self.topo.attacker()} failed")
     self._ssh(self.topo.attacker(),
-              "/usr/bin/pkill -9 -f wg_attack.py 2>/dev/null; "
-              "sleep 1",
+              # Anchored — `pkill -f wg_attack.py` self-matches.
+              "/usr/bin/pkill -9 -f '^python3 /tmp/wg_attack.py' "
+              "2>/dev/null; sleep 1",
               timeout=10)
 
   def start(self, point, run_id, out_dir):
@@ -954,7 +964,8 @@ class WgAttackGen(LoadGenerator):
 
   def cleanup(self):
     self._ssh(self.topo.attacker(),
-              "/usr/bin/pkill -9 -f wg_attack.py 2>/dev/null",
+              "/usr/bin/pkill -9 -f '^python3 /tmp/wg_attack.py' "
+"2>/dev/null",
               timeout=5)
 
 
@@ -984,7 +995,7 @@ class IntegrityGen(LoadGenerator):
 
   def prepare(self, point, run_id, out_dir):
     self._ssh(self.topo.receiver(),
-              f"/usr/bin/pkill -9 -f 'nc -l' 2>/dev/null; "
+              f"/usr/bin/pkill -9 -f '^nc -l' 2>/dev/null; "
               f"/usr/bin/pkill -9 -x sha256sum 2>/dev/null; "
               f"sleep 1",
               timeout=10)
@@ -1053,7 +1064,7 @@ class IntegrityGen(LoadGenerator):
   def cleanup(self):
     for h in (self.topo.sender(), self.topo.receiver()):
       self._ssh(h,
-                "/usr/bin/pkill -9 -f 'nc -l' 2>/dev/null; "
+                "/usr/bin/pkill -9 -f '^nc -l' 2>/dev/null; "
                 "/usr/bin/pkill -9 -x sha256sum 2>/dev/null",
                 timeout=5)
 
