@@ -67,23 +67,43 @@ class SoakSpec:
     self.relay = relay
 
 
-def run_soak(spec, *, log=print):
-  """Drive one `SoakSpec`. Returns one Result-schema row."""
+def run_soak(spec, *, log=print, samples_path=None):
+  """Drive one `SoakSpec`. Returns one Result-schema row.
+
+  When `samples_path` is provided, each sample is appended as
+  JSONL to that file *as it's taken*, so a soak that crashes
+  mid-run still leaves a partial sample series on disk for
+  forensics. The in-memory list is also returned for the
+  evaluator. When `samples_path` is None (the default), samples
+  only land on disk if the caller invokes `write_samples()`
+  afterwards — fine for short test runs.
+  """
   log(f"soak {spec.name}: {spec.duration_s}s, "
       f"sampling every {spec.sampling_interval_s}s")
   samples = []
   start_t = time.time()
   end_t = start_t + spec.duration_s
 
-  # Background sampler thread + a stop event.
+  samples_fp = None
+  if samples_path is not None:
+    os.makedirs(os.path.dirname(samples_path) or ".",
+                exist_ok=True)
+    samples_fp = open(samples_path, "w", buffering=1)
+
+  def _record(sample):
+    samples.append(sample)
+    if samples_fp is not None:
+      try:
+        samples_fp.write(json.dumps(sample) + "\n")
+        samples_fp.flush()
+      except OSError:
+        pass
+
   stop_event = threading.Event()
 
   def _sample_loop():
-    # First sample is t=0.
-    samples.append(_take_sample(spec, start_t))
+    _record(_take_sample(spec, start_t))
     while not stop_event.is_set():
-      # Sleep in small slices so the stop event interrupts
-      # promptly when the main thread wraps up.
       slept = 0.0
       while slept < spec.sampling_interval_s:
         if stop_event.is_set():
@@ -91,7 +111,7 @@ def run_soak(spec, *, log=print):
         chunk = min(0.5, spec.sampling_interval_s - slept)
         time.sleep(chunk)
         slept += chunk
-      samples.append(_take_sample(spec, start_t))
+      _record(_take_sample(spec, start_t))
 
   sampler_thread = threading.Thread(target=_sample_loop)
   sampler_thread.start()
@@ -120,7 +140,12 @@ def run_soak(spec, *, log=print):
 
   # Final sample, after load is down — useful for "did counters
   # keep moving past the load" investigations.
-  samples.append(_take_sample(spec, start_t))
+  _record(_take_sample(spec, start_t))
+  if samples_fp is not None:
+    try:
+      samples_fp.close()
+    except OSError:
+      pass
 
   evaluation = spec.evaluator(samples, spec.duration_s)
   row = {

@@ -1667,10 +1667,13 @@ def _run_continuous_soak(mode, *, out_dir, duration_s,
       load_stopper=_stop,
       evaluator=evaluate_continuous,
       relay=mode.relay)
-  row, samples = run_soak(spec, log=log)
-  write_samples(
-      os.path.join(out_dir, "continuous_samples.jsonl"),
-      samples)
+  # Stream samples to JSONL as they're taken so a crash mid-soak
+  # leaves forensic data on disk; the in-memory copy is what the
+  # evaluator uses, so callers don't need to change.
+  samples_path = os.path.join(out_dir,
+                              "continuous_samples.jsonl")
+  row, samples = run_soak(spec, log=log,
+                           samples_path=samples_path)
   return row
 
 
@@ -1887,10 +1890,10 @@ def _run_trickle_roam(mode, *, out_dir, duration_s,
       load_stopper=_trickle_stop,
       evaluator=_evaluate,
       relay=mode.relay)
-  row, samples = run_soak(spec, log=log)
-  write_samples(
-      os.path.join(out_dir, "trickle_roam_samples.jsonl"),
-      samples)
+  samples_path = os.path.join(out_dir,
+                              "trickle_roam_samples.jsonl")
+  row, samples = run_soak(spec, log=log,
+                           samples_path=samples_path)
   with open(os.path.join(out_dir, "trickle_roam_roams.json"),
             "w") as f:
     json.dump({"roams": roams}, f, indent=2, default=str)
