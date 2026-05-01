@@ -200,6 +200,21 @@ At that point: tell the user. They may ask the running agent to do a real dev sh
 
 Beyond first delivery, "done" is a function of which catalog rows are needed for the upcoming release. If a tagged release needs hardening rows, you stay until stage 5 is solid. If it doesn't, stages 5+ can wait.
 
+## Differentiator pattern — when a hardening row passes on both refs
+
+The validation pattern for a hardening row is "pass on hardened ref AND fail on pre-hardening ref". When you find a row that passes on both, two diagnoses:
+
+1. **Test is broken** — it isn't actually exercising the attack vector. Most common. Fix the test.
+2. **Test is correct, classification is wrong** — the relay had this safety property before hardening was added; the test verifies a pre-existing behavior. Reclassify the row from "Hardening" to "Safety regression" (validation: pass on every ref, failure blocks regardless).
+
+Investigate (1) first. Reading "the test is correct" as your default flatters the test author and slows discovery of real bugs. Most "passes on both" cases are testing-error.
+
+(2) is rarer but real. The amplification-probe row (T1) was an example: stage-5 validation found it correctly verified non-amplification of unregistered sources, which has always been the relay's behavior because peer registration is required end-to-end. The test was right; the categorization was wrong. We moved the row from "Hardening" to "Safety regression" rather than "fixing" a working test.
+
+When you suspect (2), check the relay history. If the safety property predates the hardening branch (`git log --follow` on the relevant source path before `740701e`), recategorize. If the safety property genuinely arrived in the hardening commits but your test passes pre-hardening anyway, you're in (1) — the test isn't engaging the right code path.
+
+Surface the diagnosis in `dev_log.md` either way. "Test passes on both → I reclassified it" is a valid outcome only after you've shown the relay history supports it.
+
 ## Anti-patterns specific to this role
 
 - **"The design is unclear, I'll just pick a reasonable interpretation."** No. Ask. The cost of mis-implementing a contract is rebuilding everything that depends on it.

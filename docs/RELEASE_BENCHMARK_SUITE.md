@@ -68,6 +68,10 @@ Single host or tiny fleet, no hardware requirement beyond "WireGuard kmod loadab
 
 ### T1 — release gate (per-tag)
 
+T1 rows fall into three classes, each with a different validation pattern. Catalog implementations must declare which class a row belongs to so the regression module applies the right rules.
+
+#### Performance rows (regression vs previous tag)
+
 | Test | Measurement | Block-on threshold |
 |------|-------------|--------------------|
 | **single-tunnel sweep, userspace** | TCP `-P 1`, TCP `-P 4`, UDP at 0.5 / 1 / 2 / 4 G offered | throughput regression > 5 % vs previous tag at any rate |
@@ -75,14 +79,46 @@ Single host or tiny fleet, no hardware requirement beyond "WireGuard kmod loadab
 | **multi-tunnel aggregate** | 1 / 5 / 20 / 50 / 100 concurrent tunnels, sustained 60 s each | aggregate-Mbps regression > 5 % at any count |
 | **latency under load, userspace** | per-packet RTT through tunnel at idle / 50 % / 100 % of single-tunnel cap; 5,000 samples/run, 10 runs | p99 regression > 10 % |
 | **latency under load, XDP** | same | p99 regression > 10 % |
+
+**Validation pattern:** compare against the previous tag's same-row result. Block if delta exceeds the per-row threshold. No expectation of behavior on a "pre-feature" reference — these rows measure performance, which has no on/off feature flag.
+
+#### Safety regression rows (pass on every ref)
+
+| Test | Measurement | Block-on threshold |
+|------|-------------|--------------------|
 | **bit-exact integrity** | 1 GiB `/dev/urandom` → tunnel → sha256 at both ends, 3 repeats | any mismatch — zero tolerance |
 | **relay restart recovery** | kill -9 relay mid-traffic, restart from systemd, measure recovery window | recovery > 30 s, or roster lost on restart |
-| **hardening: MAC1 forgery** | off-path injector sends WG handshake from random source with wrong MAC1, sustained at 10 kpps. Victim runs 1 G UDP in parallel | victim throughput drop > 10 %, OR injected packet appears in `fwd_packets` |
-| **hardening: amplification probe** | off-path data packet from unregistered source at 10 kpps | non-zero forwards; `drop_no_link` not advancing |
-| **hardening: non-WG shape** | crafted UDP — random bytes, short frame, wrong type — at 100 kpps | XDP drop counter doesn't keep pace; userspace softirq cost > 1 % |
-| **hardening: roaming attack** | off-path forged source IP rebind with correct keys; legit on-path roam in parallel | legit roam unconfirmed past confirm window, OR attacker's source still able to forward after K strikes |
+| **amplification probe** | off-path data packet from unregistered source at 10 kpps | non-zero forwards; `drop_no_link` (or equivalent unknown-source counter) not advancing; any per-peer egress traffic in response (true zero-amplification check) |
 
-T1 result format: `results/<tag>/<platform>/wg-relay/T1.json`. Diff produced as `results/<tag>/<platform>/wg-relay/diff_vs_<prev_tag>.md`. Green only if every metric is within threshold AND every hardening row passes.
+**Validation pattern:** must pass on every ref. Failure indicates a regression in a basic relay safety property. The amplification probe is in this class because non-amplification of unregistered sources predates the hardening commits — the relay always required peer registration, so the `drop_unknown_src` path has always been there. We test it to *keep it that way*, not to verify a recently-added check.
+
+#### Hardening rows (pass on hardened ref, fail on pre-hardening ref)
+
+| Test | Measurement | Block-on threshold |
+|------|-------------|--------------------|
+| **MAC1 forgery** | off-path injector sends WG handshake from random source with wrong MAC1, sustained at 10 kpps. Victim runs 1 G UDP in parallel | victim throughput drop > 10 %, OR injected packet appears in `fwd_packets`, OR MAC1 drop counter doesn't advance at attack rate |
+| **non-WG shape** | crafted UDP — random bytes, short frame, wrong type — at 100 kpps | XDP drop counter doesn't keep pace; userspace softirq cost > 1 % |
+| **roaming attack** | off-path forged source IP rebind with correct keys; legit on-path roam in parallel | legit roam unconfirmed past confirm window, OR attacker's source still able to forward after K strikes, OR strike-driven blocklist promotion doesn't fire after K failed-confirms in window |
+
+**Validation pattern (each row):**
+
+- **pass** on the hardened ref (current `wg-relay-hardening` or post-`740701e`)
+- **fail** on the pre-hardening ref (`740701e^` or earlier)
+
+Both must hold. If a row passes on both refs, two possibilities:
+
+1. The test isn't exercising the attack vector. Fix the test.
+2. The test is correct but tests a pre-existing safety property the relay had before hardening was added. Reclassify the row from "Hardening" to "Safety regression" — same test, different validation pattern.
+
+(1) is the common case. (2) is rarer but real — the amplification-probe row was originally drafted as Hardening and reclassified after stage-5 validation showed it tested behavior `wg-relay` 0.2.0 already had. Don't assume "passes on both" means broken; check the relay history.
+
+#### T1 output
+
+T1 result format: `results/<tag>/<platform>/wg-relay/T1.json`. Diff produced as `results/<tag>/<platform>/wg-relay/diff_vs_<prev_tag>.md`. Green only if:
+
+- Every performance row's regression is within threshold, AND
+- Every safety regression row passes, AND
+- Every hardening row passes on the current ref (the pre-hardening cross-check is implementer-validation work; release runs only check the current ref).
 
 ### T2 — soak (pre-major / monthly)
 
