@@ -80,7 +80,8 @@ class _ScaleTestGen(LoadGenerator):
 
   def __init__(self, topology, *, scale_test_bin,
                ssh_fn=None, scp_fn=None,
-               peers=20, active_pairs=10, msg_size=1400):
+               peers=20, active_pairs=10, msg_size=1400,
+               output_via_stdout=False):
     self.topo = topology
     self._bin = scale_test_bin
     self._ssh = ssh_fn if ssh_fn is not None else ssh
@@ -88,6 +89,10 @@ class _ScaleTestGen(LoadGenerator):
     self._peers = peers
     self._active_pairs = active_pairs
     self._msg_size = msg_size
+    # derp-scale-test supports `--json --output FILE`; hd-scale-test
+    # only supports `--json` (writes to stdout). Toggle picks the
+    # right shape so both binaries produce a JSON file at `remote`.
+    self._output_via_stdout = output_via_stdout
     self._client_outputs = []
 
   def _extra_flags(self, point):
@@ -115,7 +120,7 @@ class _ScaleTestGen(LoadGenerator):
 
     def _run_one(idx, client):
       remote = (f"/tmp/scale_{run_id}_c{idx}.json")
-      cmd = (
+      base = (
           f"{shlex.quote(self._bin)} "
           f"--host {shlex.quote(self.topo.relay_endpoint_ip)} "
           f"--port {self.topo.relay_port} "
@@ -126,8 +131,12 @@ class _ScaleTestGen(LoadGenerator):
           f"--rate-mbps {rate_mbps} "
           f"--tls "
           f"{extra} "
-          f"--json --output {shlex.quote(remote)}"
+          f"--json"
       )
+      if self._output_via_stdout:
+        cmd = f"{base} >{shlex.quote(remote)} 2>/dev/null"
+      else:
+        cmd = f"{base} --output {shlex.quote(remote)}"
       self._ssh(client, cmd, timeout=duration_s + 60,
                 no_tty=True)
       self._client_outputs[idx] = (client, remote)
@@ -401,6 +410,10 @@ class DerpMode:
   RATE_LADDER = (500, 1000, 2000, 3000, 5000, 7500)
   SCALE_TEST_BIN = DERP_SCALE_TEST_BIN
   EXTRA_SCALE_FLAGS = ""
+  # derp-scale-test supports `--output FILE`; hd-scale-test only
+  # supports `--json` (writes to stdout). HdProtocolMode flips
+  # this to True so the generator redirects stdout instead.
+  SCALE_TEST_OUTPUT_VIA_STDOUT = False
 
   def __init__(self, *, relay, topology):
     self.relay = relay
@@ -409,7 +422,9 @@ class DerpMode:
   def _scale_gen(self):
     """Build a scale-test generator with the right tool + flags."""
     gen = _ScaleTestGen(
-        self.topo, scale_test_bin=self.SCALE_TEST_BIN)
+        self.topo,
+        scale_test_bin=self.SCALE_TEST_BIN,
+        output_via_stdout=self.SCALE_TEST_OUTPUT_VIA_STDOUT)
     if self.EXTRA_SCALE_FLAGS:
       orig = gen._extra_flags
       gen._extra_flags = lambda p, _o=orig: \

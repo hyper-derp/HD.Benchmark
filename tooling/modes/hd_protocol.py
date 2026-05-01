@@ -21,6 +21,9 @@ class HdProtocolMode(DerpMode):
   tool name + the per-invocation extra flags."""
 
   SCALE_TEST_BIN = HD_SCALE_TEST_BIN
+  # hd-scale-test only supports `--json` (writes to stdout); no
+  # `--output FILE` flag like derp-scale-test has.
+  SCALE_TEST_OUTPUT_VIA_STDOUT = True
 
   def __init__(self, *, relay, topology,
                relay_key=HD_RELAY_KEY,
