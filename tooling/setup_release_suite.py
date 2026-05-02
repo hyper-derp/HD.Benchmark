@@ -34,12 +34,17 @@ Out-of-scope (later stages):
 import argparse
 import datetime as dt
 import os
+import shlex
 import sys
 
 from configs import get_platform, known_platforms
-from lib.relay import Relay, RelayError
-from lib.ssh import ssh
+from lib.relay import Relay, RelayError, resolve_remote_binary
+from lib.ssh import ssh, scp_from, scp_to
 from lib import state as state_mod
+
+VALID_MODE_NAMES = ("wg-relay", "derp", "hd-protocol")
+SCALE_TEST_BINARIES = (
+    "derp-scale-test", "derp-test-client", "hd-scale-test")
 
 
 def _emit(line):
@@ -122,6 +127,66 @@ def _check_flamegraph(host, prefix, timeout=10):
          f"&& echo FLAME_OK || echo FLAME_MISS")
   rc, out, _ = ssh(host, cmd, timeout=timeout)
   return "FLAME_OK" in out
+
+
+def _deploy_scale_test_binaries(relay_host, client_hosts,
+                                 binaries=SCALE_TEST_BINARIES,
+                                 timeout=60):
+  """Push scale-test binaries from the relay to every client.
+
+  Mirrors the legacy `deploy_hd.py` pattern. Looks up each
+  binary on the relay (deb installs to /usr/bin/, manual builds
+  often to /usr/local/bin/), stages it locally under /tmp on
+  this host, then SCPs + sudo-installs it on every client.
+
+  Idempotent: if a client already has the binary AND it matches
+  the relay's by sha256, skip. Returns (deployed, missing_on_relay):
+  a list of (host, binary) tuples actually deployed, and a list
+  of binaries that couldn't be found on the relay at all.
+  """
+  deployed = []
+  missing_on_relay = []
+  for name in binaries:
+    src = resolve_remote_binary(relay_host, name)
+    if src is None:
+      missing_on_relay.append(name)
+      continue
+    # Pull a copy local; use it for both sha-compare and push.
+    local = f"/tmp/_stage_{name}"
+    if not scp_from(relay_host, src, local, timeout=timeout):
+      missing_on_relay.append(name)
+      continue
+    rc, src_sha, _ = ssh(
+        relay_host, f"sha256sum {shlex.quote(src)} | cut -d' ' -f1",
+        timeout=15)
+    src_sha = src_sha.strip() if rc == 0 else ""
+    for c in client_hosts:
+      need_push = True
+      existing = resolve_remote_binary(c, name)
+      if existing and src_sha:
+        rc2, dst_sha, _ = ssh(
+            c, f"sha256sum {shlex.quote(existing)} "
+               f"| cut -d' ' -f1",
+            timeout=15)
+        if rc2 == 0 and dst_sha.strip() == src_sha:
+          need_push = False
+      if not need_push:
+        continue
+      stage = f"/tmp/_stage_{name}"
+      if not scp_to(c, local, stage, timeout=timeout):
+        missing_on_relay.append(f"scp_to:{c}:{name}")
+        continue
+      # Install into /usr/bin/ to match the deb layout. The
+      # mode bin paths are bare names so PATH resolution finds
+      # this regardless of whether the host already had a
+      # /usr/local/bin copy.
+      ssh(c,
+          f"sudo install -m 755 {shlex.quote(stage)} "
+          f"/usr/bin/{shlex.quote(name)} && "
+          f"rm -f {shlex.quote(stage)}",
+          timeout=15)
+      deployed.append((c, name))
+  return deployed, missing_on_relay
 
 
 def _check_perf_event_paranoid(host, timeout=10):
@@ -211,7 +276,8 @@ def main(argv=None):
   p.add_argument("--platform", required=True,
                  choices=known_platforms())
   p.add_argument("--modes", required=True,
-                 help="comma-separated, e.g. 'wg-relay'")
+                 help="comma-separated; valid: wg-relay, derp, "
+                 "hd-protocol")
   group = p.add_mutually_exclusive_group(required=True)
   group.add_argument("--tag", help="release tag, e.g. '0.2.1'")
   group.add_argument("--ref", help="git ref for dev mode")
@@ -247,9 +313,12 @@ def main(argv=None):
   modes = [m.strip() for m in args.modes.split(",") if m.strip()]
   if not modes:
     _abort("no modes specified")
-  if any(m != "wg-relay" for m in modes):
+  unknown = [m for m in modes if m not in VALID_MODE_NAMES]
+  if unknown:
     _abort(
-        f"stage-4 MVP only supports mode 'wg-relay'; got {modes}")
+        f"unknown mode(s) {unknown}; valid: {list(VALID_MODE_NAMES)}")
+  needs_wg = "wg-relay" in modes
+  needs_tls = bool(set(modes) & {"derp", "hd-protocol"})
 
   try:
     platform = get_platform(args.platform)
@@ -297,9 +366,9 @@ def main(argv=None):
           f"{h}: recommended tools missing: "
           f"{', '.join(miss_rec)}")
 
-  # 2b. MTU on wg0 (when platform declares an expected value).
+  # 2b. MTU on wg0 (only when wg-relay mode is requested).
   expected_mtu = getattr(platform, "WG_MTU", None)
-  if expected_mtu is not None:
+  if needs_wg and expected_mtu is not None:
     for c in topo.clients:
       ok = _check_mtu(c, "wg0", expected_mtu)
       if ok is False:
@@ -347,8 +416,11 @@ def main(argv=None):
         warnings.append(msg)
 
   # 2. Build Relay handle. Verify daemon is running + version.
+  # Mode='wireguard' here is just for verify_version (a one-shot
+  # `--version` invocation that doesn't depend on running mode);
+  # actual mode-specific Relay construction happens in release.py.
   relay = Relay(mode="wireguard", **platform.relay_kwargs())
-  if not relay.is_running():
+  if needs_wg and not relay.is_running():
     _abort(
         f"hyper-derp daemon not running on {topo.relay_host}; "
         "start it via systemctl or release.py before setup")
@@ -359,19 +431,52 @@ def main(argv=None):
     except RelayError as e:
       _abort(f"version check: {e}")
 
-  # 3. Bootstrap roster (idempotent).
-  try:
-    peers = [(name, ep, name) for name, ep
-             in platform.client_endpoints()]
-    relay.bootstrap_roster(peers, platform.all_links())
-  except RelayError as e:
-    _abort(f"roster bootstrap: {e}")
+  # 3. Bootstrap roster (wg-relay only — DERP/HD-Protocol have no
+  # roster; clients connect over TLS, not via a registered tunnel).
+  if needs_wg:
+    try:
+      peers = [(name, ep, name) for name, ep
+               in platform.client_endpoints()]
+      relay.bootstrap_roster(peers, platform.all_links())
+    except RelayError as e:
+      _abort(f"roster bootstrap: {e}")
 
-  # 4. Integration smoke: 4/4 ping over the tunnel.
-  if not _ping_4_4(topo.sender(), topo.receiver_tunnel_ip()):
-    _abort(
-        f"integration smoke failed: ping {topo.sender()} -> "
-        f"{topo.receiver_tunnel_ip()} did not get 4/4")
+    # 4. Integration smoke: 4/4 ping over the tunnel.
+    if not _ping_4_4(topo.sender(), topo.receiver_tunnel_ip()):
+      _abort(
+          f"integration smoke failed: ping {topo.sender()} -> "
+          f"{topo.receiver_tunnel_ip()} did not get 4/4")
+
+  # 4'. DERP/HD-Protocol preflight: deploy scale-test binaries to
+  # every client and verify the relay's TLS cert exists.
+  if needs_tls:
+    deployed, missing = _deploy_scale_test_binaries(
+        topo.relay_host, topo.clients)
+    if missing:
+      msg = (f"scale-test deploy: missing on relay or transfer "
+             f"failed: {missing}")
+      if args.strict:
+        _abort(msg)
+      warnings.append(msg)
+    if deployed:
+      notes.append(
+          f"scale-test deploy: pushed "
+          f"{len(deployed)} (host, bin) pairs to clients")
+    rc, cert_out, _ = ssh(
+        topo.relay_host,
+        "sudo test -f /etc/ssl/certs/hd.crt && "
+        "sudo test -f /etc/ssl/private/hd.key && echo OK",
+        timeout=10)
+    if rc != 0 or "OK" not in cert_out:
+      msg = (f"{topo.relay_host}: TLS cert/key for derp/hd-"
+             "protocol modes missing at /etc/ssl/{certs,"
+             "private}/hd.{crt,key} — generate with "
+             "`lib.relay.setup_cert()` or run a one-time "
+             "openssl req before the first derp/hd-protocol "
+             "tier")
+      if args.strict:
+        _abort(msg)
+      warnings.append(msg)
 
   # 5. State init.
   invocation = "dev" if args.dev else "single-tier"

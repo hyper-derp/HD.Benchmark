@@ -31,8 +31,12 @@ HD_RELAY_KEY = (
     "eeee5555ffff6666aaaa7777bbbb8888"
 )
 
-DEFAULT_BINARY = "/usr/local/bin/hyper-derp"
-DEFAULT_CLI = "/usr/bin/hdcli"
+DEFAULT_BINARY = None  # resolved per-host via `command -v`
+DEFAULT_CLI = None     # resolved per-host via `command -v`
+# Search candidates when `command -v` isn't conclusive. The deb
+# installs to /usr/bin/; ad-hoc/manual builds typically land in
+# /usr/local/bin/. Never assume one over the other.
+_BINARY_PATH_CANDIDATES = ("/usr/bin", "/usr/local/bin")
 DEFAULT_UNIT = "hyper-derp"
 DEFAULT_CONFIG_PATH = "/etc/hyper-derp/hyper-derp.yaml"
 DEFAULT_ADHOC_CONFIG = "/tmp/hd-bench.yaml"
@@ -194,9 +198,13 @@ class Relay:
           timeout=timeout)
       return True
     # Adhoc: pkill the binary and wipe the IPC sockets.
+    # `self.binary` may still be unresolved (None) if start was
+    # never called this session — that's fine, the second pkill
+    # below is the unconditional fallback by program name.
+    binary_for_pkill = self.binary or "hyper-derp"
     ssh(self.host,
         f"{self.sudo} /usr/bin/pkill -9 -f "
-        f"'^{shlex.quote(self.binary)} ' 2>/dev/null; "
+        f"'^{shlex.quote(binary_for_pkill)} ' 2>/dev/null; "
         f"{self.sudo} /usr/bin/pkill -9 hyper-derp 2>/dev/null; "
         f"{self.sudo} rm -f {shlex.quote(EINHEIT_CTL)} "
         f"{shlex.quote(EINHEIT_PUB)} {shlex.quote(self.pid_path)} "
@@ -230,8 +238,9 @@ class Relay:
     Reads `<binary> --version` (works regardless of whether the
     daemon is currently running). Raises RelayError on failure.
     """
+    binary = self._resolve_binary()
     rc, out, err = ssh(
-        self.host, f"{shlex.quote(self.binary)} --version",
+        self.host, f"{shlex.quote(binary)} --version",
         timeout=timeout)
     if rc != 0:
       raise RelayError(
@@ -256,8 +265,9 @@ class Relay:
       # require parseable version output; just confirm the binary
       # is invokable. A non-zero exit raises; an unparseable
       # version string is fine.
+      binary = self._resolve_binary()
       rc, _, err = ssh(
-          self.host, f"{shlex.quote(self.binary)} --version",
+          self.host, f"{shlex.quote(binary)} --version",
           timeout=timeout)
       if rc != 0:
         raise RelayError(
@@ -340,8 +350,9 @@ class Relay:
     daemon's table renderer wraps rows in ANSI bold + box-drawing;
     we strip those before parsing.
     """
+    cli = self._resolve_cli()
     rc, out, err = ssh(
-        self.host, f"{shlex.quote(self.cli)} wg show",
+        self.host, f"{shlex.quote(cli)} wg show",
         timeout=timeout)
     if rc != 0:
       raise RelayError(
@@ -390,8 +401,9 @@ class Relay:
 
   def wg_link_list(self, timeout=15):
     """Return raw `hdcli wg link list` output (cleaned)."""
+    cli = self._resolve_cli()
     rc, out, err = ssh(
-        self.host, f"{shlex.quote(self.cli)} wg link list",
+        self.host, f"{shlex.quote(cli)} wg link list",
         timeout=timeout)
     if rc != 0:
       raise RelayError(
@@ -426,8 +438,9 @@ class Relay:
     found" responses are treated as success. Anything else (network
     failure, daemon down, malformed argv) raises.
     """
+    cli = self._resolve_cli()
     cmd = (
-        f"{shlex.quote(self.cli)} "
+        f"{shlex.quote(cli)} "
         + " ".join(shlex.quote(p) for p in parts))
     rc, out, err = ssh(self.host, cmd, timeout=timeout)
     if rc == 0:
@@ -470,10 +483,42 @@ class Relay:
         timeout=10)
     return out.strip() == "active"
 
+  def _resolve_binary(self):
+    """Lazily resolve self.binary on the host via `command -v`.
+
+    Idempotent. The deb installs to /usr/bin/, ad-hoc installs
+    typically to /usr/local/bin/; without discovery a host
+    using one of those exclusively trips a hardcoded default.
+    """
+    if self.binary:
+      return self.binary
+    found = resolve_remote_binary(self.host, "hyper-derp")
+    if not found:
+      raise RelayError(
+          f"{self.host}: hyper-derp not in PATH or "
+          f"{', '.join(_BINARY_PATH_CANDIDATES)}; install the "
+          "deb or set Relay(binary=...)")
+    self.binary = found
+    return self.binary
+
+  def _resolve_cli(self):
+    """Lazily resolve self.cli on the host via `command -v`."""
+    if self.cli:
+      return self.cli
+    found = resolve_remote_binary(self.host, "hdcli")
+    if not found:
+      raise RelayError(
+          f"{self.host}: hdcli not in PATH or "
+          f"{', '.join(_BINARY_PATH_CANDIDATES)}; install the "
+          "deb or set Relay(cli=...)")
+    self.cli = found
+    return self.cli
+
   def _start_adhoc(self, timeout=30):
     """Stop any existing daemon, then launch fresh under nohup."""
     self.stop(timeout=15)
     time.sleep(1)
+    binary = self._resolve_binary()
     yaml = _render_yaml_config(self)
     ok = _write_remote_file(
         self.host, self.adhoc_config, yaml, sudo=self.sudo,
@@ -487,7 +532,7 @@ class Relay:
         f"{self.sudo} install -d -m 1777 {shlex.quote(EINHEIT_DIR)}; "
         f"{self.sudo} modprobe wireguard 2>/dev/null || true; "
         f"{self.sudo} modprobe tls 2>/dev/null || true; "
-        f"{self.sudo} setsid nohup {shlex.quote(self.binary)} "
+        f"{self.sudo} setsid nohup {shlex.quote(binary)} "
         f"--config {shlex.quote(self.adhoc_config)} "
         f"</dev/null >{shlex.quote(self.log_path)} 2>&1 & "
         f"echo $! | {self.sudo} tee {shlex.quote(self.pid_path)} "
@@ -522,9 +567,14 @@ def start_hd(workers):
   """Start Hyper-DERP with kTLS (legacy entry)."""
   stop_servers()
   time.sleep(1)
+  binary = resolve_remote_binary(RELAY, "hyper-derp")
+  if not binary:
+    raise RelayError(
+        f"{RELAY}: hyper-derp not found on PATH or "
+        f"{', '.join(_BINARY_PATH_CANDIDATES)}")
   ssh(RELAY,
       "sudo modprobe tls; "
-      f"sudo nohup /usr/local/bin/hyper-derp --port 3340 "
+      f"sudo nohup {shlex.quote(binary)} --port 3340 "
       f"--workers {workers} "
       "--tls-cert /etc/ssl/certs/hd.crt "
       "--tls-key /etc/ssl/private/hd.key "
@@ -543,9 +593,14 @@ def start_hd_protocol(workers):
   """Start Hyper-DERP with HD Protocol enabled (legacy entry)."""
   stop_servers()
   time.sleep(1)
+  binary = resolve_remote_binary(RELAY, "hyper-derp")
+  if not binary:
+    raise RelayError(
+        f"{RELAY}: hyper-derp not found on PATH or "
+        f"{', '.join(_BINARY_PATH_CANDIDATES)}")
   ssh(RELAY,
       "sudo modprobe tls; "
-      f"sudo nohup /usr/local/bin/hyper-derp --port 3340 "
+      f"sudo nohup {shlex.quote(binary)} --port 3340 "
       f"--workers {workers} "
       "--tls-cert /etc/ssl/certs/hd.crt "
       "--tls-key /etc/ssl/private/hd.key "
@@ -582,6 +637,35 @@ def start_ts():
 
 
 # -- Internals shared between Relay and legacy helpers --------------
+
+
+def resolve_remote_binary(host, name,
+                          candidates=_BINARY_PATH_CANDIDATES,
+                          timeout=10):
+  """Find `name`'s absolute path on `host` via SSH.
+
+  Tries `command -v <name>` first (resolves PATH-installed
+  binaries cleanly). Falls back to checking each `candidates`
+  directory for a `<dir>/<name>` file. Returns None if nothing
+  is found — callers should propagate as a setup-time error
+  rather than letting an unresolved path silently fail at run
+  time.
+  """
+  cmd = (f"command -v {shlex.quote(name)} 2>/dev/null || "
+         f"echo NOT_FOUND")
+  rc, out, _ = ssh(host, cmd, timeout=timeout)
+  if rc == 0:
+    line = out.strip().splitlines()[0] if out.strip() else ""
+    if line and line != "NOT_FOUND" and line.startswith("/"):
+      return line
+  for d in candidates:
+    rc, _, _ = ssh(
+        host,
+        f"test -x {shlex.quote(d)}/{shlex.quote(name)}",
+        timeout=timeout)
+    if rc == 0:
+      return f"{d}/{name}"
+  return None
 
 
 def _setup_cert_on(host, internal_ip, sudo, timeout=30):

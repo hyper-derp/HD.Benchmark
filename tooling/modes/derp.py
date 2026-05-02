@@ -64,10 +64,15 @@ class DerpTopology:
     return self.clients[2:]
 
 
-# Tool / flag defaults shared between DERP and HD-Protocol.
-DERP_SCALE_TEST_BIN = "/usr/local/bin/derp-scale-test"
-HD_SCALE_TEST_BIN = "/usr/local/bin/hd-scale-test"
-DERP_TEST_CLIENT_BIN = "/usr/local/bin/derp-test-client"
+# Tool / flag defaults shared between DERP and HD-Protocol. Bare
+# names by design: the deb installs to /usr/bin/, manual builds
+# typically land in /usr/local/bin/ — both are on PATH on every
+# Debian/Ubuntu host the bench fleet uses, so PATH resolution beats
+# either hardcoded prefix. Override at Mode construction time when a
+# fleet has a non-standard install location.
+DERP_SCALE_TEST_BIN = "derp-scale-test"
+HD_SCALE_TEST_BIN = "hd-scale-test"
+DERP_TEST_CLIENT_BIN = "derp-test-client"
 
 
 class _ScaleTestGen(LoadGenerator):
