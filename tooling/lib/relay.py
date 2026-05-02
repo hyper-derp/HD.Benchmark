@@ -532,6 +532,16 @@ class Relay:
     # setsid + nohup so -tt doesn't kill the daemon when our SSH
     # session ends. PID written to disk so we can kill cleanly
     # without pgrep heuristics that match this very command line.
+    #
+    # chmod 0777 the einheit IPC sockets after launch so the
+    # SSH user that later drives `hdcli wg show` can connect.
+    # When run via sudo, the daemon (root) creates sockets at
+    # mode 0755 — non-root callers can read but not send, and
+    # einheit's handshake fails opaquely with
+    # `oneshot: no matching command`. The systemd unit gets
+    # 0775 from its own UMask=000 + DynamicUser, which works for
+    # non-root via the bind-mount; the adhoc path needs the
+    # explicit chmod to mirror the operator-friendly perms.
     cmd = (
         f"{self.sudo} install -d -m 1777 {shlex.quote(EINHEIT_DIR)}; "
         f"{self.sudo} modprobe wireguard 2>/dev/null || true; "
@@ -541,7 +551,10 @@ class Relay:
         f"</dev/null >{shlex.quote(self.log_path)} 2>&1 & "
         f"echo $! | {self.sudo} tee {shlex.quote(self.pid_path)} "
         ">/dev/null; "
-        "disown; sleep 3"
+        "disown; sleep 3; "
+        f"{self.sudo} chmod 0777 "
+        f"{shlex.quote(EINHEIT_CTL)} "
+        f"{shlex.quote(EINHEIT_PUB)} 2>/dev/null || true"
     )
     ssh(self.host, cmd, timeout=timeout)
     return self.is_running(timeout=10)
