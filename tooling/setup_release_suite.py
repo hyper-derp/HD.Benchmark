@@ -415,21 +415,50 @@ def main(argv=None):
           _abort(msg)
         warnings.append(msg)
 
-  # 2. Build Relay handle. Verify daemon is running + version.
-  # Mode='wireguard' here is just for verify_version (a one-shot
-  # `--version` invocation that doesn't depend on running mode);
-  # actual mode-specific Relay construction happens in release.py.
+  # 2. Build Relay handle, ensure daemon is in the right mode, then
+  # verify version. We *start* the relay rather than just probing
+  # is_running() — a deb-installed daemon's default config has no
+  # `mode:` line and runs in DERP, where every `hdcli wg ...` verb
+  # the next step relies on returns "no matching command". start()
+  # rewrites the YAML to mode=wireguard (systemd backend) or writes
+  # a tmp YAML and launches under nohup (adhoc backend).
   relay = Relay(mode="wireguard", **platform.relay_kwargs())
-  if needs_wg and not relay.is_running():
-    _abort(
-        f"hyper-derp daemon not running on {topo.relay_host}; "
-        "start it via systemctl or release.py before setup")
+  if needs_wg:
+    if not relay.start():
+      _abort(
+          f"hyper-derp daemon failed to start on "
+          f"{topo.relay_host} in mode=wireguard; check "
+          f"`journalctl -u hyper-derp` (systemd) or "
+          f"`/tmp/hd.log` (adhoc) on the host")
+  elif needs_tls:
+    # DERP/HD-Protocol modes start their relay in release.py per
+    # mode (different yaml, different port). Setup just needs the
+    # daemon present; release.py's Relay.start() handles the
+    # mode-specific yaml + restart between mode-tier runs.
+    if not relay.is_running():
+      notes.append(
+          f"{topo.relay_host}: daemon not running yet — release.py "
+          "will start it in mode-specific config per tier")
   if not args.no_version_check:
     expected = args.tag or args.ref
     try:
       relay.verify_version(expected)
     except RelayError as e:
       _abort(f"version check: {e}")
+
+  # 2'. Mode-aware preflight probe: confirm hdcli speaks the verbs
+  # the next step depends on. This catches a daemon stuck in the
+  # wrong mode (or an einheit/hdcli version skew vs the deployed
+  # daemon) before bootstrap_roster does, with a clearer message.
+  if needs_wg:
+    try:
+      relay.wg_show()
+    except RelayError as e:
+      _abort(
+          f"{topo.relay_host}: hdcli wg show failed after start "
+          f"({e}); check daemon mode (must be `wireguard` to "
+          "expose wg verbs) and hdcli/einheit versions (deb "
+          "ships them together; mixed installs cause this)")
 
   # 3. Bootstrap roster (wg-relay only — DERP/HD-Protocol have no
   # roster; clients connect over TLS, not via a registered tunnel).

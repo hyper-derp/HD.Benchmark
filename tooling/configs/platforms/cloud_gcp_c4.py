@@ -23,9 +23,13 @@ from modes.wg_relay import Topology
 
 NAME = "cloud-gcp-c4"
 
-# Daemon binary locations on the deployed hosts.
-HD_BINARY = "/usr/local/bin/hyper-derp"
-HD_CLI = "/usr/bin/hdcli"
+# Daemon binary + CLI per the deb layout. Left unset (None) by
+# default so `lib.relay.Relay` discovers the actual paths via
+# `command -v` over SSH — works for both deb-installed
+# (/usr/bin/) and ad-hoc-built (/usr/local/bin/) deployments.
+# Override here only if a fleet has a non-standard install.
+HD_BINARY = None
+HD_CLI = None
 HD_UNIT = "hyper-derp"
 
 # Backend strategy for this platform. Cloud GCP uses adhoc launches
@@ -44,14 +48,16 @@ TUNNEL_IPS = ["10.99.0.1", "10.99.0.2", "10.99.0.3", "10.99.0.4"]
 # them via `hdcli wg peer add`.
 PEER_NAMES = ["c1", "c2", "c3", "c4"]
 
-# Attacker host (5th VM, off-path). Set to None on platforms
-# without one; T1 hardening rows then degrade to no-data.
-# Provisioning is the running agent's job; this constant just
-# tells the framework whether to *expect* the host to be
-# reachable. Override via the env if you need a different VM.
+# Attacker host (5th VM, off-path). Default None — must be
+# explicitly set via the env on a fleet that has a 5th VM
+# provisioned. T1 hardening rows degrade to no-data when this
+# is None, with a `note` recorded in state. The previous
+# default was a stale ephemeral IP; setup_release_suite would
+# spin a SSH-timeout round before deciding the attacker was
+# unreachable, costing wall time on every run.
 import os as _os
 ATTACKER_HOST = _os.environ.get(
-    "HD_BENCH_GCP_ATTACKER", "34.91.218.230")
+    "HD_BENCH_GCP_ATTACKER") or None
 
 # NIC interface name on the GCP VMs (gVNIC). Used by the XDP
 # attach + queue-halving step.
@@ -87,15 +93,24 @@ def hd_protocol_topology():
 
 
 def relay_kwargs():
-  """Build the kwargs for `lib.relay.Relay(...)` on this platform."""
-  return {
+  """Build the kwargs for `lib.relay.Relay(...)` on this platform.
+
+  `binary` and `cli` are intentionally omitted when HD_BINARY /
+  HD_CLI are None: the Relay class then discovers them per-host
+  via `command -v` over SSH, which handles both deb installs
+  (/usr/bin/) and manual builds (/usr/local/bin/).
+  """
+  kw = {
       "host": RELAY,
-      "binary": HD_BINARY,
-      "cli": HD_CLI,
       "unit": HD_UNIT,
       "backend": RELAY_BACKEND,
       "internal_ip": RELAY_INTERNAL,
   }
+  if HD_BINARY is not None:
+    kw["binary"] = HD_BINARY
+  if HD_CLI is not None:
+    kw["cli"] = HD_CLI
+  return kw
 
 
 def client_endpoints():

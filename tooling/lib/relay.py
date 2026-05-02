@@ -197,12 +197,16 @@ class Relay:
           "2>/dev/null || true",
           timeout=timeout)
       return True
-    # Adhoc: pkill the binary and wipe the IPC sockets.
-    # `self.binary` may still be unresolved (None) if start was
-    # never called this session — that's fine, the second pkill
-    # below is the unconditional fallback by program name.
+    # Adhoc: stop the systemd-deployed unit too (if present) so it
+    # doesn't respawn and fight us for port 51820 / 3340. The deb
+    # ships hyper-derp.service enabled, and on a freshly-imaged
+    # cloud VM that unit is typically running before adhoc takes
+    # over. systemctl stop is idempotent when the unit doesn't
+    # exist or isn't loaded.
     binary_for_pkill = self.binary or "hyper-derp"
     ssh(self.host,
+        f"{self.sudo} systemctl stop {shlex.quote(self.unit)} "
+        "2>/dev/null || true; "
         f"{self.sudo} /usr/bin/pkill -9 -f "
         f"'^{shlex.quote(binary_for_pkill)} ' 2>/dev/null; "
         f"{self.sudo} /usr/bin/pkill -9 hyper-derp 2>/dev/null; "

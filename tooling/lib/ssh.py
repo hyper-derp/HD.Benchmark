@@ -24,18 +24,36 @@ import re
 import subprocess
 import time
 
-SSH_KEY = os.path.expanduser("~/.ssh/google_compute_engine")
+SSH_KEY = os.path.expanduser(
+    os.environ.get("HD_BENCH_SSH_KEY",
+                   "~/.ssh/google_compute_engine"))
 
-# Static IPs (all reserved).
-RELAY = "34.13.230.9"
-CLIENTS = [
+
+def _env_csv(name, default):
+  """Read an env var, split on `,`, strip blanks. Returns the
+  literal default (already a list/str) when the env is unset.
+  """
+  v = os.environ.get(name)
+  if v is None:
+    return default
+  parts = [p.strip() for p in v.split(",") if p.strip()]
+  return parts
+
+
+# Static IPs (all reserved by default; override via env on a fleet
+# with different addresses or after a teardown/reprovision). The
+# defaults match the long-running GCP fleet `bench-relay-ew4` +
+# `bench-client-{1..4}` reservations.
+RELAY = os.environ.get("HD_BENCH_GCP_RELAY", "34.13.230.9")
+CLIENTS = _env_csv("HD_BENCH_GCP_CLIENTS", [
     "34.90.40.186",   # client-1
     "34.34.34.182",   # client-2
     "34.91.48.140",   # client-3
     "34.12.187.238",  # client-4
-]
-RELAY_INTERNAL = "10.10.1.10"
-USER = "karl"
+])
+RELAY_INTERNAL = os.environ.get(
+    "HD_BENCH_GCP_RELAY_INTERNAL", "10.10.1.10")
+USER = os.environ.get("HD_BENCH_GCP_USER", "karl")
 
 _IP_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 _SSH_CONFIG_PATH = os.path.expanduser("~/.ssh/config")
