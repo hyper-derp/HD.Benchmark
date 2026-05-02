@@ -298,13 +298,27 @@ def _run_t1_stage(state_dir, stage_name, stage_fn, *, relay_host):
     raise
   n_pass = sum(1 for r in rows
                if r.get("status") in ("ok", "pass"))
+  n_skip = sum(1 for r in rows
+               if r.get("status") in (
+                   "no-data", "skip", "not-applicable"))
+  n_fail = sum(1 for r in rows
+               if r.get("status") not in (
+                   "ok", "pass", "no-data", "skip",
+                   "not-applicable"))
   total = len(rows)
   if total == 0:
     end_status = "pass"
+  elif n_fail > 0:
+    # Any real failure dominates.
+    end_status = "fail" if n_pass == 0 else "partial"
+  elif n_pass == 0 and n_skip > 0:
+    # All rows skipped — typically because a precondition isn't
+    # met (e.g. no attacker host for T1 hardening). Stage isn't
+    # a failure; the suite report shows skip rows so the operator
+    # can see what didn't run and why.
+    end_status = "skip"
   elif n_pass == total:
     end_status = "pass"
-  elif n_pass == 0:
-    end_status = "fail"
   else:
     end_status = "partial"
   state_mod.end_stage(

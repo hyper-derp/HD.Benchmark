@@ -60,8 +60,11 @@ ATTACKER_HOST = _os.environ.get(
     "HD_BENCH_GCP_ATTACKER") or None
 
 # NIC interface name on the GCP VMs (gVNIC). Used by the XDP
-# attach + queue-halving step.
-NIC_INTERFACE = "ens4"
+# attach + queue-halving step. Current c4-highcpu images expose
+# the gVNIC as ens3; older n2/c2 images sometimes expose ens4.
+# Override via env when a fleet uses a non-default NIC name.
+NIC_INTERFACE = _os.environ.get(
+    "HD_BENCH_GCP_NIC", "ens3")
 
 
 def wg_relay_topology():
@@ -127,7 +130,17 @@ def client_endpoints():
 
 
 def all_links():
-  """Star: client[0] linked to every other client. Sufficient for
-  single-tunnel + multi-tunnel + latency-under-load topologies.
+  """Star + bg link.
+
+  Star: client[0] (c1) ↔ {c2, c3, c4} — covers single-tunnel
+  (c1↔c2), multi-tunnel-aggregate (c1 hub), and the latency-
+  under-load foreground path (c1↔c2).
+  Bg link: c3 ↔ c4 — `WgUdpEchoBgGen` runs iperf3 from c3 to
+  c4's tunnel IP for latency-under-load saturation; without
+  this link the relay drops the bg traffic as drop_no_link
+  and the 50pct/100pct latency rows record idle baselines.
   """
-  return [(PEER_NAMES[0], n) for n in PEER_NAMES[1:]]
+  star = [(PEER_NAMES[0], n) for n in PEER_NAMES[1:]]
+  if len(PEER_NAMES) >= 4:
+    star.append((PEER_NAMES[2], PEER_NAMES[3]))
+  return star

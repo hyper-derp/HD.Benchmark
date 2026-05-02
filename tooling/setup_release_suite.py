@@ -59,10 +59,16 @@ def _abort(reason):
   sys.exit(1)
 
 
-REQUIRED_TOOLS = ("tcpdump", "iperf3", "ethtool", "ip", "wg")
-RECOMMENDED_TOOLS = ("nc", "sha256sum",
-                     # T3 capture path:
-                     "perf", "mpstat", "ss", "bpftool")
+# Tools the wg-relay tier rows assume. `ethtool` is used by the
+# XDP-attach stage for queue halving (gVNIC quirk); `nc` is the
+# data-path tool for the bit-exact-integrity row. Without either
+# the relevant row reports a confusing failure rather than a
+# clear preflight gate.
+REQUIRED_TOOLS = ("tcpdump", "iperf3", "ethtool", "ip", "wg",
+                  "nc", "sha256sum")
+RECOMMENDED_TOOLS = (
+    # T3 capture path:
+    "perf", "mpstat", "ss", "bpftool")
 DEFAULT_FLAMEGRAPH_PREFIX = "/opt/FlameGraph"
 
 

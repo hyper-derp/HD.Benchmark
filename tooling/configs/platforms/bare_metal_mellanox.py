@@ -108,5 +108,15 @@ def client_endpoints():
 
 
 def all_links():
-  """Star: alice ↔ {bob, carol, dave}."""
-  return [(PEER_NAMES[0], n) for n in PEER_NAMES[1:]]
+  """Star + bg link.
+
+  Star: alice ↔ {bob, carol, dave} for the foreground paths.
+  Bg link: carol ↔ dave so latency-under-load's bg iperf3
+  (clients[2] → clients[3]'s tunnel IP) can forward through
+  the relay; without this link the relay drops bg traffic as
+  drop_no_link.
+  """
+  star = [(PEER_NAMES[0], n) for n in PEER_NAMES[1:]]
+  if len(PEER_NAMES) >= 4:
+    star.append((PEER_NAMES[2], PEER_NAMES[3]))
+  return star

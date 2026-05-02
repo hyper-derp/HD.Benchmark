@@ -302,11 +302,23 @@ class Relay:
           f"enable_xdp only supported for mode='wireguard'; "
           f"current mode is {self.mode!r}")
     if halve_queues:
-      ssh(self.host,
+      # ethtool may be absent on minimal cloud images. Fall back
+      # to a clear RelayError so the operator installs it rather
+      # than a silent attach failure that's hard to attribute.
+      rc, _, err = ssh(
+          self.host,
+          f"command -v ethtool >/dev/null 2>&1 || "
+          f"{{ echo MISSING; exit 1; }}; "
           f"{self.sudo} ethtool -L "
-          f"{shlex.quote(interface)} rx 1 tx 1 "
-          "2>/dev/null || true",
+          f"{shlex.quote(interface)} rx 1 tx 1",
           timeout=15)
+      if rc != 0:
+        raise RelayError(
+            f"{self.host}: ethtool -L {interface} rx 1 tx 1 "
+            f"failed (rc={rc} err={err[:160]}); install "
+            "ethtool (apt install ethtool) or build the relay "
+            "with halve_queues=False on a NIC that supports "
+            "multi-queue XDP")
     self.xdp_interface = interface
     self.xdp_bpf_obj_path = bpf_obj_path
     if not self.restart(timeout=timeout):
